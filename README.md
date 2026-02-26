@@ -11,6 +11,24 @@ Comprehensive knowledge base for go-kratos microservices framework.
 
 ---
 
+## Quick Install
+
+Just ask your AI agent:
+
+```
+Install kratos-skills from https://github.com/lwx-cloud/kratos-skills
+```
+
+Or manually:
+
+```bash
+# Project-level (recommended)
+git clone https://github.com/lwx-cloud/kratos-skills.git .claude/skills/kratos-skills
+
+# Personal-level (all projects)
+git clone https://github.com/lwx-cloud/kratos-skills.git ~/.claude/skills/kratos-skills
+```
+
 ## Overview
 
 Kratos Skills is a comprehensive knowledge base designed for AI agents and developers working with the [go-kratos](https://go-kratos.dev/) microservices framework. It provides production-ready patterns, best practices, and troubleshooting guides for building scalable, maintainable microservices.

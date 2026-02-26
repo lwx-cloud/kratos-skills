@@ -11,6 +11,24 @@ go-kratos 微服务框架综合知识库
 
 ---
 
+## 快速安装
+
+直接询问你的 AI 助手：
+
+```
+Install kratos-skills from https://github.com/lwx-cloud/kratos-skills
+```
+
+或手动安装：
+
+```bash
+# 项目级安装（推荐）
+git clone https://github.com/lwx-cloud/kratos-skills.git .claude/skills/kratos-skills
+
+# 个人级安装（所有项目）
+git clone https://github.com/lwx-cloud/kratos-skills.git ~/.claude/skills/kratos-skills
+```
+
 ## 概述
 
 Kratos Skills 是专为使用 [go-kratos](https://go-kratos.dev/) 微服务框架的 AI 助手和开发者设计的综合知识库。它提供了构建可扩展、可维护微服务的生产级模式、最佳实践和故障排除指南。
