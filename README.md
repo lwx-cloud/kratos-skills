@@ -7,6 +7,8 @@ Comprehensive knowledge base for go-kratos microservices framework.
 
 [English](README.md) | [简体中文](README_CN.md)
 
+> **Note**: This skill follows the [Agent Skills specification](https://github.com/anthropics/skills/) format, inspired by [zero-skills](https://github.com/zeromicro/zero-skills).
+
 ---
 
 ## Overview

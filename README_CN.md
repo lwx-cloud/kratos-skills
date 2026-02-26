@@ -7,6 +7,8 @@ go-kratos 微服务框架综合知识库
 
 [English](README.md) | [简体中文](README_CN.md)
 
+> **说明**: 本 Skill 遵循 [Agent Skills 规范](https://github.com/anthropics/skills/) 格式，参考自 [zero-skills](https://github.com/zeromicro/zero-skills)。
+
 ---
 
 ## 概述
