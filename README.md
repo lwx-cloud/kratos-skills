@@ -13,19 +13,29 @@ Comprehensive knowledge base for go-kratos microservices framework.
 
 ## Quick Install
 
-Just ask your AI agent:
+### Via skills CLI (Recommended)
+
+```bash
+# Project-level (recommended)
+npx skills add lwx-cloud/kratos-skills
+
+# Personal-level (all projects)
+npx skills add lwx-cloud/kratos-skills -g
+```
+
+### Or ask your AI agent
 
 ```
 Install kratos-skills from https://github.com/lwx-cloud/kratos-skills
 ```
 
-Or manually:
+### Or manually
 
 ```bash
-# Project-level (recommended)
+# Project-level
 git clone https://github.com/lwx-cloud/kratos-skills.git .claude/skills/kratos-skills
 
-# Personal-level (all projects)
+# Personal-level
 git clone https://github.com/lwx-cloud/kratos-skills.git ~/.claude/skills/kratos-skills
 ```
 

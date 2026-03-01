@@ -13,19 +13,29 @@ go-kratos 微服务框架综合知识库
 
 ## 快速安装
 
-直接询问你的 AI 助手：
+### 通过 skills CLI（推荐）
+
+```bash
+# 项目级（推荐）
+npx skills add lwx-cloud/kratos-skills
+
+# 个人级（所有项目共享）
+npx skills add lwx-cloud/kratos-skills -g
+```
+
+### 或让 AI 助手安装
 
 ```
 Install kratos-skills from https://github.com/lwx-cloud/kratos-skills
 ```
 
-或手动安装：
+### 或手动安装
 
 ```bash
-# 项目级安装（推荐）
+# 项目级
 git clone https://github.com/lwx-cloud/kratos-skills.git .claude/skills/kratos-skills
 
-# 个人级安装（所有项目）
+# 个人级
 git clone https://github.com/lwx-cloud/kratos-skills.git ~/.claude/skills/kratos-skills
 ```
 
