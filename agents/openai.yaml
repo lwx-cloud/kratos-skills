@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kratos Engineering"
+  short_description: "Build, migrate, debug, and review Kratos services"
+  default_prompt: "Use $kratos-skills to implement, migrate, debug, or review this Go-Kratos repository with version-locked references."

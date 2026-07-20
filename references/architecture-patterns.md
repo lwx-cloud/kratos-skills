@@ -1,420 +1,145 @@
 # Layered Architecture Patterns
 
-This guide covers DDD (Domain-Driven Design) and Clean Architecture patterns in kratos.
+> Version-sensitive wiring and framework APIs follow the [compatibility baseline](compatibility.md). Preserve the target repository's intentional architecture.
 
-## Overview
+## Contents
 
-Kratos promotes a layered architecture inspired by DDD and Clean Architecture:
+- [Discover the local boundaries](#discover-the-local-boundaries)
+- [Keep dependency direction explicit](#keep-dependency-direction-explicit)
+- [Implement a vertical change](#implement-a-vertical-change)
+- [Maintain the Wire graph](#maintain-the-wire-graph)
+- [Handle cross-cutting boundaries](#handle-cross-cutting-boundaries)
+- [Verification](#verification)
 
-```
-┌─────────────────────────────────────┐
-│         Service Layer               │  ← API Handler (HTTP/gRPC)
-│    (Application / Interface)        │
-├─────────────────────────────────────┤
-│           Biz Layer                 │  ← Business Logic / Domain
-│      (Domain / Use Cases)           │
-├─────────────────────────────────────┤
-│          Data Layer                 │  ← Data Access / Repository
-│    (Infrastructure / Adapter)       │
-└─────────────────────────────────────┘
-```
+## Discover the local boundaries
 
-## Directory Structure
+Inspect constructors, provider sets, package imports, and representative request paths before applying the standard layout.
 
-```
-internal/
-├── server/           # Transport server initialization
-│   ├── http.go      # HTTP server setup
-│   ├── grpc.go      # gRPC server setup
-│   └── server.go    # Common server code
-├── service/          # Service layer - API handlers
-│   ├── service.go   # ProviderSet
-│   └── greeter.go   # Service implementation
-├── biz/              # Biz layer - Business logic
-│   ├── biz.go       # ProviderSet
-│   └── greeter.go   # Use cases & repository interfaces
-└── data/             # Data layer - Data access
-    ├── data.go      # ProviderSet & database init
-    └── greeter.go   # Repository implementation
+| Standard package | Primary responsibility |
+| --- | --- |
+| `internal/server` | Construct HTTP/gRPC servers and register generated services |
+| `internal/service` | Adapt generated transport messages to biz inputs and outputs |
+| `internal/biz` | Own domain models, use cases, policies, and repository contracts |
+| `internal/data` | Implement repository contracts with databases, caches, and external clients |
+
+Follow these boundaries when the repository uses them. When it uses a different deliberate architecture, preserve its dependency direction and conventions unless the task explicitly requests migration.
+
+## Keep dependency direction explicit
+
+The standard dependency direction is:
+
+```text
+generated API <- service -> biz <- data
+                              ^
+                         repository contract
 ```
 
-## Layer Responsibilities
+- Service imports generated API and biz packages.
+- Biz defines behavior required from persistence and external systems.
+- Data imports biz to implement those contracts.
+- Biz remains independent of generated transport, SQL drivers, ORM clients, and registry implementations.
 
-### Service Layer (`internal/service/`)
-
-- Implements API definitions from proto files
-- Handles request/response conversion (DTO)
-- Orchestrates biz layer use cases
-- **NO business logic** - just delegation
+Design repository methods from business needs:
 
 ```go
-package service
-
-import (
-    "context"
-    v1 "helloworld/api/helloworld/v1"
-    "helloworld/internal/biz"
-)
-
-type GreeterService struct {
-    v1.UnimplementedGreeterServer
-    uc *biz.GreeterUsecase
-}
-
-func NewGreeterService(uc *biz.GreeterUsecase) *GreeterService {
-    return &GreeterService{uc: uc}
-}
-
-func (s *GreeterService) SayHello(ctx context.Context, req *v1.HelloRequest) (*v1.HelloReply, error) {
-    // Delegate to biz layer, convert types
-    g, err := s.uc.CreateGreeter(ctx, &biz.Greeter{Name: req.Name})
-    if err != nil {
-        return nil, err
-    }
-    return &v1.HelloReply{Message: "Hello " + g.Name}, nil
-}
-```
-
-### Biz Layer (`internal/biz/`)
-
-- Contains business logic and rules
-- Defines repository interfaces (Dependency Inversion)
-- Contains use cases / domain services
-- Pure business logic, no infrastructure concerns
-
-```go
-package biz
-
-import (
-    "context"
-    "github.com/go-kratos/kratos/v2/log"
-)
-
-// Greeter domain model
-type Greeter struct {
-    Name string
-}
-
-// GreeterRepo repository interface (defined in biz layer!)
-type GreeterRepo interface {
-    Save(context.Context, *Greeter) (*Greeter, error)
-    Update(context.Context, *Greeter) (*Greeter, error)
-    FindByID(context.Context, int64) (*Greeter, error)
-    ListAll(context.Context) ([]*Greeter, error)
-}
-
-// GreeterUsecase use case
-type GreeterUsecase struct {
-    repo GreeterRepo  // Depends on interface, not implementation
-    log  *log.Helper
-}
-
-func NewGreeterUsecase(repo GreeterRepo, logger log.Logger) *GreeterUsecase {
-    return &GreeterUsecase{
-        repo: repo,
-        log:  log.NewHelper(logger),
-    }
-}
-
-func (uc *GreeterUsecase) CreateGreeter(ctx context.Context, g *Greeter) (*Greeter, error) {
-    uc.log.WithContext(ctx).Infof("CreateGreeter: %s", g.Name)
-    // Business logic here
-    return uc.repo.Save(ctx, g)
-}
-```
-
-### Data Layer (`internal/data/`)
-
-- Implements repository interfaces from biz layer
-- Handles database/cache operations
-- Converts PO (Persistence Object) to DTO (Domain Object)
-- Infrastructure concerns only
-
-```go
-package data
-
-import (
-    "context"
-    "helloworld/internal/biz"
-    "github.com/go-kratos/kratos/v2/log"
-)
-
-type greeterRepo struct {
-    data *Data
-    log  *log.Helper
-}
-
-// NewGreeterRepo creates repository (implements biz.GreeterRepo)
-func NewGreeterRepo(data *Data, logger log.Logger) biz.GreeterRepo {
-    return &greeterRepo{
-        data: data,
-        log:  log.NewHelper(logger),
-    }
-}
-
-func (r *greeterRepo) Save(ctx context.Context, g *biz.Greeter) (*biz.Greeter, error) {
-    // Database operations
-    // Convert biz.Greeter to database model if needed
-    return g, nil
-}
-
-func (r *greeterRepo) Update(ctx context.Context, g *biz.Greeter) (*biz.Greeter, error) {
-    return g, nil
-}
-
-func (r *greeterRepo) FindByID(ctx context.Context, id int64) (*biz.Greeter, error) {
-    return &biz.Greeter{}, nil
-}
-
-func (r *greeterRepo) ListAll(ctx context.Context) ([]*biz.Greeter, error) {
-    return []*biz.Greeter{}, nil
-}
-```
-
-## Wire Dependency Injection
-
-### Provider Sets
-
-Each layer defines a ProviderSet:
-
-```go
-// internal/data/data.go
-package data
-
-import (
-    "github.com/google/wire"
-)
-
-// ProviderSet is data providers
-var ProviderSet = wire.NewSet(
-    NewData,
-    NewGreeterRepo,
-    // Add more repositories...
-)
-
-// Data contains database clients
-type Data struct {
-    // db *sql.DB
-    // redis *redis.Client
-}
-
-func NewData() (*Data, error) {
-    return &Data{}, nil
-}
-```
-
-```go
-// internal/biz/biz.go
-package biz
-
-import "github.com/google/wire"
-
-// ProviderSet is biz providers
-var ProviderSet = wire.NewSet(
-    NewGreeterUsecase,
-    // Add more use cases...
-)
-```
-
-```go
-// internal/service/service.go
-package service
-
-import "github.com/google/wire"
-
-// ProviderSet is service providers
-var ProviderSet = wire.NewSet(
-    NewGreeterService,
-    // Add more services...
-)
-```
-
-### Wire Configuration
-
-```go
-// cmd/server/wire.go
-//go:build wireinject
-// +build wireinject
-
-package main
-
-import (
-    "github.com/go-kratos/kratos/v2"
-    "github.com/go-kratos/kratos/v2/log"
-    "github.com/google/wire"
-    "helloworld/internal/biz"
-    "helloworld/internal/conf"
-    "helloworld/internal/data"
-    "helloworld/internal/server"
-    "helloworld/internal/service"
-)
-
-// wireApp initializes kratos application
-func wireApp(*conf.Server, *conf.Data, log.Logger) (*kratos.App, func(), error) {
-    panic(wire.Build(
-        server.ProviderSet,
-        data.ProviderSet,
-        biz.ProviderSet,
-        service.ProviderSet,
-        newApp,
-    ))
-}
-```
-
-## ✅ Correct vs ❌ Incorrect Examples
-
-### ✅ Correct: Interface in Biz, Implementation in Data
-
-```go
-// internal/biz/greeter.go
-type GreeterRepo interface {
-    Save(context.Context, *Greeter) (*Greeter, error)
-}
-
-// internal/data/greeter.go
-func NewGreeterRepo(data *Data, logger log.Logger) biz.GreeterRepo {
-    return &greeterRepo{data: data, log: log.NewHelper(logger)}
-}
-```
-
-### ❌ Incorrect: Interface in Data
-
-```go
-// Wrong: interface defined in data layer
-// internal/data/greeter.go
-type GreeterRepo interface {
-    Save(context.Context, *biz.Greeter) (*biz.Greeter, error)
-}
-
-// This creates wrong dependency direction!
-```
-
-### ✅ Correct: Service Delegates to Biz
-
-```go
-func (s *GreeterService) SayHello(ctx context.Context, req *v1.HelloRequest) (*v1.HelloReply, error) {
-    // Just delegate, no business logic
-    g, err := s.uc.CreateGreeter(ctx, &biz.Greeter{Name: req.Name})
-    if err != nil {
-        return nil, err
-    }
-    return &v1.HelloReply{Message: "Hello " + g.Name}, nil
-}
-```
-
-### ❌ Incorrect: Business Logic in Service
-
-```go
-func (s *GreeterService) SayHello(ctx context.Context, req *v1.HelloRequest) (*v1.HelloReply, error) {
-    // Wrong: business logic in service layer!
-    if req.Name == "" {
-        return nil, errors.New("name required")
-    }
-    if len(req.Name) > 100 {
-        return nil, errors.New("name too long")
-    }
-    // Database access in service!
-    s.db.Exec("INSERT INTO greeters...")
-    return &v1.HelloReply{Message: "Hello " + req.Name}, nil
-}
-```
-
-### ✅ Correct: Use Case Orchestration
-
-```go
-func (uc *OrderUsecase) CreateOrder(ctx context.Context, o *Order) (*Order, error) {
-    // Business logic
-    if o.Amount <= 0 {
-        return nil, ErrInvalidAmount
-    }
-
-    // Use repository interface
-    return uc.orderRepo.Save(ctx, o)
-}
-```
-
-### ❌ Incorrect: Direct DB Access in Biz
-
-```go
-func (uc *OrderUsecase) CreateOrder(ctx context.Context, o *Order) (*Order, error) {
-    // Wrong: direct database access in biz layer!
-    uc.db.Exec("INSERT INTO orders...")
-    return o, nil
-}
-```
-
-## Complete Workflow
-
-### 1. Define Repository Interface (Biz)
-
-```go
-// internal/biz/user.go
-type User struct {
-    ID    int64
-    Name  string
-    Email string
-}
-
 type UserRepo interface {
-    Create(ctx context.Context, u *User) (*User, error)
-    GetByID(ctx context.Context, id int64) (*User, error)
-    Update(ctx context.Context, u *User) (*User, error)
-    Delete(ctx context.Context, id int64) error
-}
-```
-
-### 2. Implement Repository (Data)
-
-```go
-// internal/data/user.go
-type userRepo struct {
-    data *Data
+	Create(context.Context, *User) (*User, error)
+	FindByID(context.Context, int64) (*User, error)
 }
 
-func (r *userRepo) Create(ctx context.Context, u *biz.User) (*biz.User, error) {
-    // Implementation with actual database
-    return u, nil
-}
-// ... implement other methods
-```
-
-### 3. Create Use Case (Biz)
-
-```go
-// internal/biz/user_usecase.go
 type UserUsecase struct {
-    repo UserRepo
-}
-
-func (uc *UserUsecase) Register(ctx context.Context, u *User) (*User, error) {
-    // Business rules: validate email, check duplicates, etc.
-    return uc.repo.Create(ctx, u)
+	repo UserRepo
 }
 ```
 
-### 4. Create Service Handler
+Return interfaces from data constructors when the repository convention uses compile-time abstraction:
 
 ```go
-// internal/service/user.go
-func (s *UserService) CreateUser(ctx context.Context, req *v1.CreateUserRequest) (*v1.User, error) {
-    u, err := s.uc.Register(ctx, &biz.User{
-        Name:  req.Name,
-        Email: req.Email,
-    })
-    if err != nil {
-        return nil, err
-    }
-    return &v1.User{
-        Id:    u.ID,
-        Name:  u.Name,
-        Email: u.Email,
-    }, nil
+func NewUserRepo(data *Data, logger log.Logger) biz.UserRepo {
+	return &userRepo{data: data, log: log.NewHelper(logger)}
 }
 ```
 
-## References
+## Implement a vertical change
 
-- [Kratos Layout](https://github.com/go-kratos/kratos-layout)
-- [DDD Layered Architecture](https://martinfowler.com/bliki/PresentationDomainDataLayering.html)
-- [Clean Architecture](https://blog.cleancoder.com/uncle-bob/2012/08/13/the-clean-architecture.html)
+Account for every boundary touched by the contract:
+
+1. Change the Protobuf contract and regenerate tracked output when the public API changes.
+2. Adapt request and response types in service methods.
+3. Put business validation, authorization decisions, and orchestration in the use case.
+4. Add or change repository behavior in the biz contract.
+5. Implement persistence or external calls in data.
+6. Update constructors, provider sets, configuration, and tests.
+
+Keep service adaptation thin:
+
+```go
+func (s *UserService) CreateUser(ctx context.Context, req *v1.CreateUserRequest) (*v1.User, error) {
+	user, err := s.uc.Create(ctx, &biz.User{Name: req.Name, Email: req.Email})
+	if err != nil {
+		return nil, err
+	}
+	return toAPIUser(user), nil
+}
+```
+
+Keep use-case rules independent of transport and storage:
+
+```go
+func (uc *UserUsecase) Create(ctx context.Context, user *User) (*User, error) {
+	if err := uc.policy.ValidateCreate(user); err != nil {
+		return nil, err
+	}
+	return uc.repo.Create(ctx, user)
+}
+```
+
+## Maintain the Wire graph
+
+Keep provider sets beside the packages that own constructors:
+
+```go
+var ProviderSet = wire.NewSet(NewData, NewUserRepo)
+```
+
+The injector composes package provider sets and the application constructor:
+
+```go
+//go:build wireinject
+
+func wireApp(*conf.Server, *conf.Data, log.Logger) (*kratos.App, func(), error) {
+	panic(wire.Build(
+		server.ProviderSet,
+		data.ProviderSet,
+		biz.ProviderSet,
+		service.ProviderSet,
+		newApp,
+	))
+}
+```
+
+Regenerate Wire output after any constructor parameter, return type, interface binding, provider set, or cleanup function changes.
+
+## Handle cross-cutting boundaries
+
+- Propagate the incoming context through use cases, repositories, and outbound clients.
+- Translate persistence and upstream errors into the domain error model at the owning boundary.
+- Own transactions in the use case when one business operation spans multiple repository calls.
+- Keep logging, metrics, tracing, authentication, validation, and recovery in middleware or explicit policy components.
+- Keep generated types at the service boundary unless the repository intentionally uses them internally.
+
+## Verification
+
+Complete an architectural change when:
+
+- every contract change is accounted for across API, service, biz, data, configuration, and wiring;
+- package imports preserve the intended dependency direction;
+- Wire generation succeeds and cleanup paths remain connected;
+- focused tests cover business rules and repository error translation; and
+- the final diff contains intentional generated output only.
+
+## Sources
+
+- [Kratos layout](https://github.com/go-kratos/kratos-layout)
 - [Google Wire](https://github.com/google/wire)
+- [Presentation-Domain-Data Layering](https://martinfowler.com/bliki/PresentationDomainDataLayering.html)

@@ -1,393 +1,98 @@
-# OpenAPI Generation Guide
+# OpenAPI Generation
 
-This guide covers OpenAPI/Swagger documentation generation from proto files.
+Treat Protobuf API definitions and HTTP annotations as the source of truth. Use the repository's pinned `protoc-gen-openapi`, Buf, or Make target; inspect those files before changing generation commands.
 
-## Overview
+## Contents
 
-Kratos can generate OpenAPI 3.0 documentation from protobuf definitions using `protoc-gen-openapi`. This allows you to:
-- Auto-generate API documentation
-- Import into Postman, Swagger UI, or other API tools
-- Maintain single source of truth (proto files)
+- [Generation](#generation)
+- [Contract annotations](#contract-annotations)
+- [Compatibility](#compatibility)
+- [Serving documentation](#serving-documentation)
+- [Verification](#verification)
 
-## Installation
+## Generation
 
-```bash
-# Install protoc-gen-openapi
-go install github.com/google/gnostic/cmd/protoc-gen-openapi@latest
-
-# Or install to $GOPATH/bin
-go get -u github.com/google/gnostic/cmd/protoc-gen-openapi
-```
-
-## Basic Usage
-
-### Generate OpenAPI from Proto
+Prefer the repository-owned target because it fixes plugin versions, include paths, options, and output location:
 
 ```bash
-protoc --proto_path=. \
-    --proto_path=./third_party \
-    --openapi_out=. \
-    api/user/v1/user.proto
+make openapi
 ```
 
-### Output Options
+When the repository exposes a direct command, preserve its existing parameters:
 
 ```bash
-# Generate with YAML output
-protoc --proto_path=. \
-    --proto_path=./third_party \
-    --openapi_out=yaml=true:. \
-    api/user/v1/user.proto
-
-# Generate to specific directory
-protoc --proto_path=. \
-    --proto_path=./third_party \
-    --openapi_out=path=docs/openapi:. \
-    api/user/v1/user.proto
+protoc \
+  --proto_path=. \
+  --proto_path=third_party \
+  --openapi_out=yaml=true:docs/openapi \
+  api/user/v1/user.proto
 ```
 
-## Proto Annotations
+Pin tool versions in the same mechanism as the other generators. A local installation, CI image, `tools.go`, Buf remote plugin, or Make variable is valid when it is already repository policy.
 
-### Basic OpenAPI Info
+## Contract Annotations
+
+Start with the HTTP mapping; it determines the public operation:
 
 ```protobuf
-syntax = "proto3";
-
-package api.user.v1;
-
-import "google/api/annotations.proto";
-import "openapi/v3/annotations.proto";
-
-option go_package = "user/api/user/v1;v1";
-
-// User Service API
-//
-// Service for managing users in the system.
-// Provides CRUD operations for user management.
-service UserService {
-    option (openapi.v3.operation) = {
-        summary: "User Service"
-        description: "API for user management"
-        tags: ["users"]
-    };
-
-    rpc CreateUser(CreateUserRequest) returns (User) {
-        option (google.api.http) = {
-            post: "/v1/users"
-            body: "*"
-        };
-        option (openapi.v3.operation) = {
-            summary: "Create a new user"
-            description: "Creates a new user with the provided information"
-            tags: ["users"]
-        };
-    }
-
-    rpc GetUser(GetUserRequest) returns (User) {
-        option (google.api.http) = {
-            get: "/v1/users/{id}"
-        };
-        option (openapi.v3.operation) = {
-            summary: "Get user by ID"
-            description: "Retrieves a user by their unique identifier"
-            tags: ["users"]
-        };
-    }
+rpc CreateUser(CreateUserRequest) returns (User) {
+  option (google.api.http) = {
+    post: "/v1/users"
+    body: "*"
+  };
+  option (openapi.v3.operation) = {
+    summary: "Create user"
+    tags: "users"
+  };
 }
 ```
 
-### Schema Annotations
-
-```protobuf
-// User represents a user in the system
-message User {
-    option (openapi.v3.schema) = {
-        title: "User"
-        description: "A user in the system"
-        required: ["name", "email"]
-    };
-
-    // User ID
-    int64 id = 1 [
-        (openapi.v3.property) = {
-            description: "Unique identifier for the user"
-            example: { string_value: "12345" }
-        }
-    ];
-
-    // User name
-    string name = 2 [
-        (openapi.v3.property) = {
-            description: "Full name of the user"
-            example: { string_value: "John Doe" }
-            min_length: 1
-            max_length: 100
-        }
-    ];
-
-    // Email address
-    string email = 3 [
-        (openapi.v3.property) = {
-            description: "Email address of the user"
-            format: "email"
-            example: { string_value: "john@example.com" }
-        }
-    ];
-
-    // User status
-    Status status = 4 [
-        (openapi.v3.property) = {
-            description: "Current status of the user"
-            enum: ["ACTIVE", "INACTIVE"]
-        }
-    ];
-}
-```
-
-### Request/Response Examples
+Add schema metadata where it contributes contract detail beyond comments and validation rules:
 
 ```protobuf
 message CreateUserRequest {
-    option (openapi.v3.schema) = {
-        example: {
-            yaml_value: "name: John Doe\nemail: john@example.com"
-        }
-    };
-
-    string name = 1;
-    string email = 2;
-}
-
-message CreateUserResponse {
-    User user = 1;
-
-    option (openapi.v3.schema) = {
-        example: {
-            yaml_value: "user:\n  id: 12345\n  name: John Doe\n  email: john@example.com"
-        }
-    };
-}
-```
-
-## Complete Example
-
-```protobuf
-syntax = "proto3";
-
-package api.order.v1;
-
-import "google/api/annotations.proto";
-import "google/protobuf/timestamp.proto";
-import "validate/validate.proto";
-
-option go_package = "order/api/order/v1;v1";
-
-// Order Service API
-service OrderService {
-    // Create a new order
-    rpc CreateOrder(CreateOrderRequest) returns (Order) {
-        option (google.api.http) = {
-            post: "/v1/orders"
-            body: "*"
-        };
+  string email = 1 [
+    (buf.validate.field).string.email = true,
+    (openapi.v3.property) = {
+      description: "Account email"
+      format: "email"
     }
-
-    // Get order details
-    rpc GetOrder(GetOrderRequest) returns (Order) {
-        option (google.api.http) = {
-            get: "/v1/orders/{order_id}"
-        };
-    }
-
-    // List orders
-    rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse) {
-        option (google.api.http) = {
-            get: "/v1/orders"
-        };
-    }
-}
-
-// Order message
-message Order {
-    string order_id = 1;
-    string user_id = 2;
-    repeated OrderItem items = 3;
-    double total_amount = 4;
-    OrderStatus status = 5;
-    google.protobuf.Timestamp created_at = 6;
-}
-
-// Order item
-message OrderItem {
-    string product_id = 1;
-    string product_name = 2;
-    int32 quantity = 3;
-    double unit_price = 4;
-}
-
-// Order status enum
-enum OrderStatus {
-    ORDER_STATUS_UNSPECIFIED = 0;
-    ORDER_STATUS_PENDING = 1;
-    ORDER_STATUS_CONFIRMED = 2;
-    ORDER_STATUS_SHIPPED = 3;
-    ORDER_STATUS_DELIVERED = 4;
-    ORDER_STATUS_CANCELLED = 5;
-}
-
-// Create order request
-message CreateOrderRequest {
-    string user_id = 1 [(validate.rules).string.min_len = 1];
-    repeated OrderItem items = 2 [(validate.rules).repeated.min_items = 1];
-    string shipping_address = 3;
-}
-
-// Get order request
-message GetOrderRequest {
-    string order_id = 1 [(validate.rules).string.min_len = 1];
-}
-
-// List orders request
-message ListOrdersRequest {
-    string user_id = 1;
-    int32 page_size = 2 [(validate.rules).int32.lte = 100];
-    string page_token = 3;
-}
-
-// List orders response
-message ListOrdersResponse {
-    repeated Order orders = 1;
-    string next_page_token = 2;
-    int32 total_size = 3;
+  ];
 }
 ```
 
-## Makefile Integration
+Match the repository's validation system; read [validate-patterns.md](validate-patterns.md) before changing PGV or Protovalidate annotations. Keep examples synthetic and stable.
 
-```makefile
-.PHONY: openapi
-openapi:
-	@protoc --proto_path=. \
-		--proto_path=./third_party \
-		--openapi_out=yaml=true:./docs \
-		$(API_PROTO_FILES)
-```
+## Compatibility
 
-## Serving Swagger UI
+Review generated changes as public API changes:
 
-### HTTP Handler
+- Paths, methods, request bodies, path parameters, and response schemas must match generated Kratos handlers.
+- Required fields, enum values, field types, and error shapes affect clients even when Go code still compiles.
+- Operation IDs and tags may drive client names or documentation navigation.
+- Removed or renamed schemas require an explicit migration plan.
+- Generated output should be reproducible from a clean tree with the pinned toolchain.
 
-```go
-package server
+Commit generated specifications only when repository policy does so. Keep generation output in one location rather than maintaining a second handwritten specification.
 
-import (
-    "net/http"
-    "os"
+## Serving Documentation
 
-    "github.com/gorilla/mux"
-)
+Separate specification generation from UI hosting. If the service exposes the specification or Swagger UI, define:
 
-// RegisterOpenAPI registers OpenAPI documentation routes
-func RegisterOpenAPI(router *mux.Router) {
-    // Serve OpenAPI spec
-    router.HandleFunc("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
-        data, err := os.ReadFile("docs/openapi.yaml")
-        if err != nil {
-            http.Error(w, err.Error(), http.StatusInternalServerError)
-            return
-        }
-        w.Header().Set("Content-Type", "application/yaml")
-        w.Write(data)
-    })
+- environments where the route is enabled;
+- authentication and network exposure;
+- cache headers and content type;
+- whether the served artifact is embedded at build time or read from disk;
+- a version relationship between the running service and published document.
 
-    // Redirect to Swagger UI
-    router.HandleFunc("/swagger", func(w http.ResponseWriter, r *http.Request) {
-        http.Redirect(w, r, "/swagger-ui/", http.StatusMovedPermanently)
-    })
-}
-```
+Production exposure is a deployment policy decision, not a generator default.
 
-## Using Swagger UI Docker
+## Verification
 
-```yaml
-# docker-compose.yaml
-version: '3.8'
-services:
-  swagger-ui:
-    image: swaggerapi/swagger-ui
-    ports:
-      - "8080:8080"
-    environment:
-      - SWAGGER_JSON=/openapi/openapi.yaml
-    volumes:
-      - ./docs:/openapi
-```
-
-## Best Practices
-
-### ✅ Document All Endpoints
-
-```protobuf
-// ❌ Avoid undocumented services
-service UserService {
-    rpc CreateUser(CreateUserRequest) returns (User);
-}
-
-// ✅ Document with OpenAPI annotations
-service UserService {
-    option (openapi.v3.operation) = {
-        summary: "User Service API"
-        description: "Complete user management API"
-    };
-
-    rpc CreateUser(CreateUserRequest) returns (User) {
-        option (google.api.http) = { post: "/v1/users" body: "*" };
-        option (openapi.v3.operation) = {
-            summary: "Create user"
-            description: "Creates a new user account"
-            tags: ["users"]
-        };
-    }
-}
-```
-
-### ✅ Include Examples
-
-```protobuf
-message CreateUserRequest {
-    option (openapi.v3.schema) = {
-        example: {
-            yaml_value: "name: John Doe\nemail: john@example.com\nage: 30"
-        }
-    };
-}
-```
-
-### ✅ Use Validation Rules
-
-```protobuf
-message UserRequest {
-    // These validation rules will be documented in OpenAPI
-    string email = 1 [
-        (validate.rules).string.email = true,
-        (openapi.v3.property) = {
-            format: "email"
-        }
-    ];
-
-    int32 age = 2 [
-        (validate.rules).int32 = { gte: 0, lte: 150 },
-        (openapi.v3.property) = {
-            minimum: 0
-            maximum: 150
-        }
-    ];
-}
-```
+Complete an OpenAPI change when the pinned repository target succeeds, a second run is clean, every intended operation and schema appears, paths match generated handlers, compatibility changes are reviewed, examples contain no secrets, and documentation serving has an explicit exposure policy.
 
 ## References
 
 - [Kratos OpenAPI Guide](https://go-kratos.dev/docs/guide/openapi)
-- [OpenAPI Specification](https://swagger.io/specification/)
-- [protoc-gen-openapi](https://github.com/google/gnostic)
-
+- [protoc-gen-openapi](https://github.com/google/gnostic/tree/main/cmd/protoc-gen-openapi)
+- [OpenAPI Specification](https://spec.openapis.org/oas/latest.html)

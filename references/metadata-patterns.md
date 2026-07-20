@@ -1,115 +1,71 @@
 # Metadata Patterns
 
-This guide covers metadata propagation in kratos for distributed tracing and context passing.
+Read [compatibility.md](compatibility.md) before copying version-sensitive APIs.
 
-## Overview
+Use Kratos metadata for bounded cross-service context such as tenant, locale, request, or routing identifiers. Keep credentials in the authentication mechanism that owns them.
 
-Metadata allows passing information between services without modifying request/response payloads. Common use cases:
-- Authentication tokens
-- Request IDs
-- Trace context
-- User context
+## Server Metadata
 
-## Server-Side Metadata
-
-### Reading Metadata
+Read inbound values from the server context:
 
 ```go
-package service
+md, ok := metadata.FromServerContext(ctx)
+if !ok {
+    return nil, errors.Unauthorized("MISSING_CONTEXT", "request context is missing")
+}
+tenantID := md.Get("x-tenant-id")
+```
 
-import (
-    "github.com/go-kratos/kratos/v2/metadata"
+Treat inbound metadata as untrusted input. Define an allowlist, normalize keys at the boundary, validate value size and syntax, and translate missing or invalid values into stable Kratos errors.
+
+Set transport response headers through the server transport:
+
+```go
+if tr, ok := transport.FromServerContext(ctx); ok {
+    tr.ReplyHeader().Set("x-request-id", requestID)
+}
+```
+
+## Client Metadata
+
+Append keys while preserving unrelated client metadata. A repeated key is replaced by the later value:
+
+```go
+ctx = metadata.AppendToClientContext(
+    ctx,
+    "x-tenant-id", tenantID,
+    "x-request-id", requestID,
 )
-
-func (s *UserService) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, error) {
-    // Get metadata from context
-    md, ok := metadata.FromServerContext(ctx)
-    if !ok {
-        return nil, errors.Unauthorized("MISSING_METADATA", "metadata not found")
-    }
-
-    // Read specific key
-    userID := md.Get("x-user-id")
-    requestID := md.Get("x-request-id")
-
-    s.log.WithContext(ctx).Infof("Request from user: %s", userID)
-
-    return s.uc.GetUser(ctx, req.Id)
-}
+reply, err := client.GetUser(ctx, req)
 ```
 
-### Setting Response Metadata
+Create a fresh client metadata context only when replacement is intentional:
 
 ```go
-func (s *UserService) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, error) {
-    if tr, ok := transport.FromServerContext(ctx); ok {
-        tr.ReplyHeader().Set("x-custom-header", "value")
-        tr.ReplyHeader().Set("x-request-id", generateRequestID())
-    }
-
-    return s.uc.GetUser(ctx, req.Id)
-}
+ctx = metadata.NewClientContext(ctx, metadata.New(map[string][]string{
+    "x-tenant-id": []string{tenantID},
+}))
 ```
 
-## Client-Side Metadata
+Pass the caller's `ctx` through client calls so cancellation, deadlines, tracing, and metadata remain connected. Centralize propagation in a client middleware when the same allowlist applies to many calls.
 
-### Sending Metadata
+## Propagation Policy
 
-```go
-package client
+For every key, define:
 
-import (
-    "github.com/go-kratos/kratos/v2/metadata"
-    "github.com/go-kratos/kratos/v2/transport/grpc"
-)
+| Decision | Required answer |
+| --- | --- |
+| Owner | Which boundary creates and validates it? |
+| Direction | Inbound, outbound, or both? |
+| Trust | May callers set it, or must the service overwrite it? |
+| Cardinality | Is the value bounded enough for logs and traces? |
+| Privacy | May it cross service or region boundaries? |
 
-func callService(ctx context.Context) {
-    // Add metadata to context
-    ctx = metadata.AppendToClientContext(ctx,
-        "x-user-id", "12345",
-        "x-request-id", generateRequestID(),
-        "x-trace-id", traceID,
-    )
+Use trace propagation from OpenTelemetry middleware rather than copying trace headers manually. Use JWT claims or another authenticated identity source for authorization decisions; metadata may carry a derived, validated identity for downstream convenience only when policy permits it.
 
-    resp, err := client.GetUser(ctx, &pb.GetUserRequest{Id: "1"})
-}
-```
+## Verification
 
-## Metadata Middleware
-
-### Custom Metadata Middleware
-
-```go
-package middleware
-
-import (
-    "github.com/go-kratos/kratos/v2/metadata"
-    "github.com/go-kratos/kratos/v2/middleware"
-    "github.com/go-kratos/kratos/v2/transport"
-)
-
-func Metadata() middleware.Middleware {
-    return func(handler middleware.Handler) middleware.Handler {
-        return func(ctx context.Context, req interface{}) (reply interface{}, err error) {
-            if tr, ok := transport.FromServerContext(ctx); ok {
-                // Extract metadata from transport
-                md := metadata.MD{}
-
-                // Copy headers to metadata
-                for _, key := range []string{"x-user-id", "x-request-id", "x-trace-id"} {
-                    if val := tr.RequestHeader().Get(key); val != "" {
-                        md.Set(key, val)
-                    }
-                }
-
-                ctx = metadata.NewServerContext(ctx, md)
-            }
-
-            return handler(ctx, req)
-        }
-    }
-}
-```
+Complete a metadata change when every key has an owner and direction, HTTP and gRPC propagation are tested, overwrite and missing-value behavior are explicit, untrusted values are validated, and cancellation and deadlines survive the client boundary.
 
 ## References
 

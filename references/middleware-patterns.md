@@ -1,466 +1,143 @@
 # Middleware Patterns
 
-This guide covers middleware patterns in kratos.
+> Version-sensitive. Compare middleware APIs with the [compatibility baseline](compatibility.md) and verify execution order in the target repository.
 
-## Overview
+## Contents
 
-Middleware in kratos provides a way to intercept requests and responses, enabling cross-cutting concerns like logging, authentication, rate limiting, and more.
+- [Understand execution order](#understand-execution-order)
+- [Compose server middleware](#compose-server-middleware)
+- [Compose client middleware](#compose-client-middleware)
+- [Write custom middleware](#write-custom-middleware)
+- [Select operations](#select-operations)
+- [Route to specialized references](#route-to-specialized-references)
+- [Verification](#verification)
 
-## Middleware Execution Order
+## Understand execution order
 
-Middleware follows **First In, Last Out (FILO)** order:
+Kratos builds middleware with `middleware.Chain`. The first middleware in the list is the outermost wrapper:
 
-```
-         ┌───────────────────┐
-         │MIDDLEWARE 1       │
-         │ ┌────────────────┐│
-         │ │MIDDLEWARE 2    ││
-         │ │ ┌─────────────┐││
-         │ │ │MIDDLEWARE 3 │││
-         │ │ │ ┌─────────┐ │││
-REQUEST  │ │ │ │  YOUR   │ │││  RESPONSE
-   ──────┼─┼─┼─▷ HANDLER ○─┼┼┼───▷
-         │ │ │ └─────────┘ │││
-         │ │ └─────────────┘││
-         │ └────────────────┘│
-         └───────────────────┘
+```text
+request  -> first -> second -> handler
+response <- first <- second <- handler
 ```
 
-## Built-in Middleware
+Order affects panic capture, trace context, logs, metrics, authentication, validation, retries, rate limiting, and circuit-breaker observations. Derive the order from required behavior and test both accepted and rejected requests.
 
-| Middleware | Purpose | Location |
-|------------|---------|----------|
-| `recovery` | Panic recovery | `middleware/recovery` |
-| `logging` | Request logging | `middleware/logging` |
-| `tracing` | Distributed tracing | `middleware/tracing` |
-| `validate` | Request validation | `middleware/validate` |
-| `metrics` | Metrics collection | `middleware/metrics` |
-| `metadata` | Metadata propagation | `middleware/metadata` |
-| `auth` | JWT authentication | `middleware/auth` |
-| `ratelimit` | Rate limiting | `middleware/ratelimit` |
-| `circuitbreaker` | Circuit breaker | `middleware/circuitbreaker` |
+## Compose server middleware
 
-## Basic Usage
-
-### Server Middleware
+A common server chain keeps recovery outermost and records rejected requests in traces and logs:
 
 ```go
+package server
+
 import (
-    "github.com/go-kratos/kratos/v2/middleware"
-    "github.com/go-kratos/kratos/v2/middleware/recovery"
-    "github.com/go-kratos/kratos/v2/middleware/logging"
-    "github.com/go-kratos/kratos/v2/middleware/tracing"
-    "github.com/go-kratos/kratos/v2/middleware/validate"
-    "github.com/go-kratos/kratos/v2/transport/http"
+	validate "github.com/go-kratos/kratos/contrib/middleware/validate/v2"
+	"github.com/go-kratos/kratos/v2/log"
+	"github.com/go-kratos/kratos/v2/middleware/logging"
+	"github.com/go-kratos/kratos/v2/middleware/recovery"
+	"github.com/go-kratos/kratos/v2/middleware/tracing"
+	"github.com/go-kratos/kratos/v2/transport/http"
 )
 
-// HTTP Server
-httpSrv := http.NewServer(
-    http.Middleware(
-        recovery.Recovery(),
-        tracing.Server(),
-        logging.Server(logger),
-        validate.Validator(),
-    ),
-)
-
-// gRPC Server
-grpcSrv := grpc.NewServer(
-    grpc.Middleware(
-        recovery.Recovery(),
-        tracing.Server(),
-        logging.Server(logger),
-    ),
-)
+func Middleware(logger log.Logger) http.ServerOption {
+	return http.Middleware(
+		recovery.Recovery(),
+		tracing.Server(),
+		logging.Server(logger),
+		validate.ProtoValidate(),
+	)
+}
 ```
 
-### Client Middleware
+Add authentication, metrics, and rate limiting according to policy. For example, put authentication before work that requires identity; place metrics outside a limiter when rejected requests must be counted.
+
+## Compose client middleware
+
+Client middleware observes outbound calls:
 
 ```go
-// HTTP Client
-conn, err := http.NewClient(
-    ctx,
-    http.WithEndpoint(endpoint),
-    http.WithMiddleware(
-        recovery.Recovery(),
-        tracing.Client(),
-        logging.Client(logger),
-    ),
-)
-
-// gRPC Client
 conn, err := grpc.DialInsecure(
-    ctx,
-    grpc.WithEndpoint(endpoint),
-    grpc.WithMiddleware(
-        recovery.Recovery(),
-        tracing.Client(),
-    ),
+	ctx,
+	grpc.WithEndpoint(endpoint),
+	grpc.WithMiddleware(
+		tracing.Client(),
+		metrics.Client(metricsOptions...),
+		circuitbreaker.Client(),
+	),
 )
 ```
 
-## Custom Middleware
+Decide retry placement explicitly. Retrying outside a circuit breaker records each attempt; retrying inside presents one combined result. Retry only operations with a defined idempotency strategy.
 
-### Basic Middleware Structure
+## Write custom middleware
+
+Keep custom middleware transport-agnostic unless it genuinely needs headers or operation metadata:
 
 ```go
-package middleware
+package middlewarex
 
 import (
-    "context"
-    "github.com/go-kratos/kratos/v2/middleware"
-    "github.com/go-kratos/kratos/v2/transport"
+	"context"
+	"time"
+
+	"github.com/go-kratos/kratos/v2/middleware"
+	"github.com/go-kratos/kratos/v2/transport"
 )
 
-// MyMiddleware creates a custom middleware
-func MyMiddleware() middleware.Middleware {
-    return func(handler middleware.Handler) middleware.Handler {
-        return func(ctx context.Context, req interface{}) (reply interface{}, err error) {
-            // Pre-processing (request phase)
-            if tr, ok := transport.FromServerContext(ctx); ok {
-                // Access transport information
-                operation := tr.Operation()
-                // ...
-            }
-
-            // Call next handler
-            reply, err = handler(ctx, req)
-
-            // Post-processing (response phase)
-            // ...
-
-            return reply, err
-        }
-    }
+func Timing(observe func(operation string, elapsed time.Duration, err error)) middleware.Middleware {
+	return func(next middleware.Handler) middleware.Handler {
+		return func(ctx context.Context, req any) (reply any, err error) {
+			started := time.Now()
+			operation := ""
+			if tr, ok := transport.FromServerContext(ctx); ok {
+				operation = tr.Operation()
+			}
+			defer func() { observe(operation, time.Since(started), err) }()
+			return next(ctx, req)
+		}
+	}
 }
 ```
 
-### Middleware with Configuration
+Preserve context, return the next handler's reply and error, and keep labels bounded. Use `FromClientContext` for outbound middleware.
+
+## Select operations
+
+Use `middleware/selector` to apply middleware to generated transport operations:
 
 ```go
-package middleware
-
-type options struct {
-    headerKey string
-    headerValue string
-}
-
-// Option configures the middleware
-type Option func(*options)
-
-func WithHeader(key, value string) Option {
-    return func(o *options) {
-        o.headerKey = key
-        o.headerValue = value
-    }
-}
-
-// CustomHeader middleware adds custom headers
-func CustomHeader(opts ...Option) middleware.Middleware {
-    o := &options{
-        headerKey:   "X-Custom-Header",
-        headerValue: "default",
-    }
-    for _, opt := range opts {
-        opt(o)
-    }
-
-    return func(handler middleware.Handler) middleware.Handler {
-        return func(ctx context.Context, req interface{}) (reply interface{}, err error) {
-            if tr, ok := transport.FromServerContext(ctx); ok {
-                tr.ReplyHeader().Set(o.headerKey, o.headerValue)
-            }
-            return handler(ctx, req)
-        }
-    }
-}
-
-// Usage
-httpSrv := http.NewServer(
-    http.Middleware(
-        CustomHeader(WithHeader("X-Version", "v1.0")),
-    ),
-)
+protected := selector.Server(authMiddleware).
+	Match(func(_ context.Context, operation string) bool {
+		return operation != "/auth.v1.Auth/Login"
+	}).
+	Build()
 ```
 
-## Authentication Middleware Example
+Operation values are not necessarily raw HTTP paths. Inspect generated handlers or runtime telemetry before writing matchers. Prefer public-operation allowlists so new methods inherit protection.
 
-```go
-package auth
+## Route to specialized references
 
-import (
-    "context"
-    "strings"
-    "github.com/go-kratos/kratos/v2/errors"
-    "github.com/go-kratos/kratos/v2/middleware"
-    "github.com/go-kratos/kratos/v2/transport"
-)
+- Authentication: [auth-patterns.md](auth-patterns.md)
+- Validation: [validate-patterns.md](validate-patterns.md)
+- Metrics: [metrics-patterns.md](metrics-patterns.md)
+- Circuit breaking: [circuit-breaker-patterns.md](circuit-breaker-patterns.md)
+- Rate limiting: [ratelimit-patterns.md](ratelimit-patterns.md)
+- Recovery: [recovery-patterns.md](recovery-patterns.md)
+- Tracing: [tracing-patterns.md](tracing-patterns.md)
 
-var (
-    ErrMissingToken = errors.Unauthorized("MISSING_TOKEN", "authorization token required")
-    ErrInvalidToken = errors.Unauthorized("INVALID_TOKEN", "invalid authorization token")
-)
+Load only the references involved in the chain under change.
 
-// TokenValidator validates JWT tokens
-type TokenValidator interface {
-    Validate(ctx context.Context, token string) (userID string, err error)
-}
+## Verification
 
-// Server creates an auth middleware
-func Server(validator TokenValidator) middleware.Middleware {
-    return func(handler middleware.Handler) middleware.Handler {
-        return func(ctx context.Context, req interface{}) (reply interface{}, err error) {
-            // Extract token from header
-            tr, ok := transport.FromServerContext(ctx)
-            if !ok {
-                return nil, ErrMissingToken
-            }
+Complete middleware work only when:
 
-            auth := tr.RequestHeader().Get("Authorization")
-            if auth == "" {
-                return nil, ErrMissingToken
-            }
+- the chain order is tested for success, validation rejection, authentication rejection, timeout, and panic paths;
+- server middleware is not accidentally installed on clients or vice versa;
+- selectors match the observed operation names;
+- context cancellation and deadlines reach the handler and outbound calls; and
+- logs, metrics, and traces include failures without exposing sensitive data.
 
-            // Parse Bearer token
-            parts := strings.SplitN(auth, " ", 2)
-            if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-                return nil, ErrInvalidToken
-            }
+## Sources
 
-            // Validate token
-            userID, err := validator.Validate(ctx, parts[1])
-            if err != nil {
-                return nil, ErrInvalidToken
-            }
-
-            // Add user ID to context for downstream use
-            ctx = WithUserID(ctx, userID)
-
-            return handler(ctx, req)
-        }
-    }
-}
-
-// userIDKey is the context key for user ID
-type userIDKey struct{}
-
-// WithUserID adds user ID to context
-func WithUserID(ctx context.Context, userID string) context.Context {
-    return context.WithValue(ctx, userIDKey{}, userID)
-}
-
-// UserIDFrom extracts user ID from context
-func UserIDFrom(ctx context.Context) (string, bool) {
-    userID, ok := ctx.Value(userIDKey{}).(string)
-    return userID, ok
-}
-```
-
-## Route-Specific Middleware (Selector)
-
-Use `selector` to apply middleware to specific routes:
-
-```go
-import "github.com/go-kratos/kratos/v2/middleware/selector"
-
-// HTTP Server with selective middleware
-httpSrv := http.NewServer(
-    http.Middleware(
-        recovery.Recovery(),
-        // Apply auth middleware only to specific paths
-        selector.Server(auth.Server(validator)).
-            Prefix("/v1/admin/").
-            Match(func(ctx context.Context, operation string) bool {
-                // Custom match logic
-                return strings.HasPrefix(operation, "/helloworld.Greeter/Admin")
-            }).
-            Build(),
-    ),
-)
-```
-
-### Selector Matching Rules
-
-```go
-selector.Server(middlewares...).
-    Path("/helloworld.Greeter/SayHello", "/helloworld.Greeter/SayHi").  // Exact match
-    Regex(`/helloworld.Greeter/Get[0-9]+`).                             // Regex match
-    Prefix("/helloworld.", "/admin.").                                  // Prefix match
-    Match(func(ctx context.Context, operation string) bool {            // Custom match
-        return strings.Contains(operation, "Admin")
-    }).
-    Build()
-```
-
-**Note**: Selector matches on `operation` (gRPC path format: `/package.Service/Method`), not HTTP routes.
-
-## Logging Middleware
-
-```go
-import "github.com/go-kratos/kratos/v2/middleware/logging"
-
-// Server-side logging
-httpSrv := http.NewServer(
-    http.Middleware(
-        logging.Server(logger),
-    ),
-)
-
-// Client-side logging
-conn, err := http.NewClient(
-    ctx,
-    http.WithMiddleware(
-        logging.Client(logger),
-    ),
-)
-```
-
-## Tracing Middleware (OpenTelemetry)
-
-```go
-import (
-    "github.com/go-kratos/kratos/v2/middleware/tracing"
-    "go.opentelemetry.io/otel/trace"
-)
-
-// Server-side tracing
-httpSrv := http.NewServer(
-    http.Middleware(
-        tracing.Server(
-            tracing.WithTracerProvider(tracerProvider),
-            tracing.WithPropagator(propagator),
-        ),
-    ),
-)
-
-// Client-side tracing
-conn, err := http.NewClient(
-    ctx,
-    http.WithMiddleware(
-        tracing.Client(
-            tracing.WithTracerProvider(tracerProvider),
-            tracing.WithPropagator(propagator),
-        ),
-    ),
-)
-```
-
-## Rate Limiting Middleware
-
-```go
-import (
-    "github.com/go-kratos/kratos/v2/middleware/ratelimit"
-    "github.com/go-kratos/aegis/ratelimit/bbr"
-)
-
-// BBR rate limiting (server-side)
-httpSrv := http.NewServer(
-    http.Middleware(
-        ratelimit.Server(ratelimit.WithLimiter(bbr.New())),
-    ),
-)
-```
-
-## Circuit Breaker Middleware
-
-```go
-import (
-    "github.com/go-kratos/kratos/v2/middleware/circuitbreaker"
-    "github.com/go-kratos/aegis/circuitbreaker"
-)
-
-// Circuit breaker (client-side)
-conn, err := http.NewClient(
-    ctx,
-    http.WithMiddleware(
-        circuitbreaker.Client(
-            circuitbreaker.WithBreaker(sre.New()),
-        ),
-    ),
-)
-```
-
-## Recovery Middleware
-
-```go
-import "github.com/go-kratos/kratos/v2/middleware/recovery"
-
-httpSrv := http.NewServer(
-    http.Middleware(
-        recovery.Recovery(
-            recovery.WithHandler(func(ctx context.Context, req, err interface{}) error {
-                // Custom panic handler
-                log.Errorf("panic recovered: %v", err)
-                return errors.InternalServer("PANIC", "internal server error")
-            }),
-        ),
-    ),
-)
-```
-
-## ✅ Correct vs ❌ Incorrect Examples
-
-### ✅ Correct: Proper Middleware Chain
-
-```go
-httpSrv := http.NewServer(
-    http.Middleware(
-        recovery.Recovery(),        // Always first
-        tracing.Server(),           // Tracing early
-        logging.Server(logger),     // Logging after tracing
-        validate.Validator(),       // Validation before business logic
-        auth.Server(validator),     // Auth before handlers
-    ),
-)
-```
-
-### ❌ Incorrect: Wrong Order
-
-```go
-httpSrv := http.NewServer(
-    http.Middleware(
-        validate.Validator(),       // Wrong: should be after logging/tracing
-        auth.Server(validator),     // Wrong: recovery should be first
-        recovery.Recovery(),
-    ),
-)
-```
-
-### ✅ Correct: Using Transport Context
-
-```go
-func CustomMiddleware() middleware.Middleware {
-    return func(handler middleware.Handler) middleware.Handler {
-        return func(ctx context.Context, req interface{}) (reply interface{}, err error) {
-            if tr, ok := transport.FromServerContext(ctx); ok {
-                // Use transport information
-                operation := tr.Operation()
-                headers := tr.RequestHeader()
-                // ...
-            }
-            return handler(ctx, req)
-        }
-    }
-}
-```
-
-### ❌ Incorrect: Ignoring Transport Check
-
-```go
-func BadMiddleware() middleware.Middleware {
-    return func(handler middleware.Handler) middleware.Handler {
-        return func(ctx context.Context, req interface{}) (reply interface{}, err error) {
-            tr := transport.FromServerContext(ctx)  // Wrong: ignoring ok check
-            // Will panic if not from server transport
-            headers := tr.RequestHeader()
-            return handler(ctx, req)
-        }
-    }
-}
-```
-
-## References
-
-- [Kratos Middleware](https://go-kratos.dev/docs/component/middleware/overview)
-- [Aegis (Resilience)](https://github.com/go-kratos/aegis)
-- [OpenTelemetry](https://opentelemetry.io/)
+- [Kratos v2.9.2 middleware chain](https://github.com/go-kratos/kratos/blob/v2.9.2/middleware/middleware.go)
+- [Kratos v2.9.2 middleware selector](https://github.com/go-kratos/kratos/blob/v2.9.2/middleware/selector/selector.go)

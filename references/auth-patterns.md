@@ -1,292 +1,190 @@
 # JWT Authentication Patterns
 
-This guide covers JWT authentication patterns in kratos.
+> Version-sensitive. Compare the target repository with the [compatibility baseline](compatibility.md). The compile-tested Kratos middleware uses JWT v5 callback types.
 
-## Overview
+## Contents
 
-Kratos provides JWT middleware for authenticating requests between clients and servers.
+- [Choose the token boundary](#choose-the-token-boundary)
+- [Configure server authentication](#configure-server-authentication)
+- [Read claims](#read-claims)
+- [Use client authentication](#use-client-authentication)
+- [Select protected operations](#select-protected-operations)
+- [Issue tokens](#issue-tokens)
+- [Verification](#verification)
 
-## Installation
+## Choose the token boundary
 
-```bash
-go get github.com/go-kratos/kratos/v2/middleware/auth/jwt
-go get github.com/golang-jwt/jwt/v4
-```
+Decide which identity the token represents:
 
-## Server-Side Authentication
+| Boundary | Pattern |
+| --- | --- |
+| Public user request | Validate the user token on the server and propagate explicit identity fields internally |
+| Service-to-service identity | Let `jwt.Client` sign service claims for each outbound request |
+| Forwarding an existing bearer token | Propagate the incoming credential deliberately; `jwt.Client` creates a new token rather than forwarding one |
 
-### Basic JWT Server
+Load signing keys from configuration or a key-management system. Keep issuer, audience, algorithm, key ID, and rotation policy explicit.
 
-```go
-package server
+## Configure server authentication
 
-import (
-    "github.com/go-kratos/kratos/v2/middleware/auth/jwt"
-    "github.com/go-kratos/kratos/v2/transport/http"
-    jwtv4 "github.com/golang-jwt/jwt/v4"
-)
-
-func NewHTTPServer(c *conf.Server, logger log.Logger) *http.Server {
-    var opts = []http.ServerOption{
-        http.Middleware(
-            recovery.Recovery(),
-            jwt.Server(
-                func(token *jwtv4.Token) (interface{}, error) {
-                    return []byte("your-secret-key"), nil
-                },
-            ),
-            logging.Server(logger),
-        ),
-    }
-
-    return http.NewServer(opts...)
-}
-```
-
-### With Custom Claims
-
-```go
-// Custom claims
-type CustomClaims struct {
-    UserID   int64  `json:"user_id"`
-    Username string `json:"username"`
-    Role     string `json:"role"`
-    jwtv4.StandardClaims
-}
-
-// Server with custom claims
-jwt.Server(
-    func(token *jwtv4.Token) (interface{}, error) {
-        return []byte("your-secret-key"), nil
-    },
-    jwt.WithClaims(func() jwtv4.Claims {
-        return &CustomClaims{}
-    }),
-)
-```
-
-### With Signing Method
-
-```go
-jwt.Server(
-    func(token *jwtv4.Token) (interface{}, error) {
-        return []byte("your-secret-key"), nil
-    },
-    jwt.WithSigningMethod(jwtv4.SigningMethodHS256),
-)
-```
-
-## Client-Side Authentication
-
-### HTTP Client
-
-```go
-import (
-    "github.com/go-kratos/kratos/v2/middleware/auth/jwt"
-    "github.com/go-kratos/kratos/v2/transport/http"
-    jwtv4 "github.com/golang-jwt/jwt/v4"
-)
-
-func NewHTTPClient() (*http.Client, error) {
-    return http.NewClient(
-        context.Background(),
-        http.WithEndpoint("127.0.0.1:8000"),
-        http.WithMiddleware(
-            jwt.Client(
-                func(token *jwtv4.Token) (interface{}, error) {
-                    return []byte("service-secret-key"), nil
-                },
-            ),
-        ),
-    )
-}
-```
-
-### gRPC Client
-
-```go
-conn, err := grpc.DialInsecure(
-    context.Background(),
-    grpc.WithEndpoint("dns:///127.0.0.1:9000"),
-    grpc.WithMiddleware(
-        jwt.Client(
-            func(token *jwtv4.Token) (interface{}, error) {
-                return []byte("service-secret-key"), nil
-            },
-        ),
-    ),
-)
-```
-
-## Extracting User Information
-
-```go
-package service
-
-import (
-    "github.com/go-kratos/kratos/v2/middleware/auth/jwt"
-)
-
-func (s *UserService) GetProfile(ctx context.Context, req *pb.GetProfileRequest) (*pb.Profile, error) {
-    // Extract claims from context
-    claims, ok := jwt.FromContext(ctx)
-    if !ok {
-        return nil, errors.Unauthorized("UNAUTHORIZED", "missing token")
-    }
-
-    // Assert to custom claims
-    customClaims, ok := claims.(*CustomClaims)
-    if !ok {
-        return nil, errors.InternalServer("CLAIMS_ERROR", "invalid claims type")
-    }
-
-    // Use user info
-    userID := customClaims.UserID
-    username := customClaims.Username
-
-    return s.uc.GetProfile(ctx, userID)
-}
-```
-
-## JWT Token Generation
+Use JWT v5 types and lock the accepted signing method:
 
 ```go
 package auth
 
 import (
-    "time"
-    jwtv4 "github.com/golang-jwt/jwt/v4"
+	"errors"
+	"slices"
+
+	"github.com/go-kratos/kratos/v2/middleware"
+	kratosjwt "github.com/go-kratos/kratos/v2/middleware/auth/jwt"
+	jwt "github.com/golang-jwt/jwt/v5"
 )
 
-// GenerateToken generates a new JWT token
-func GenerateToken(userID int64, username string, secret string) (string, error) {
-    claims := CustomClaims{
-        UserID:   userID,
-        Username: username,
-        Role:     "user",
-        StandardClaims: jwtv4.StandardClaims{
-            ExpiresAt: time.Now().Add(24 * time.Hour).Unix(),
-            IssuedAt:  time.Now().Unix(),
-            Issuer:    "myapp",
-        },
-    }
-
-    token := jwtv4.NewWithClaims(jwtv4.SigningMethodHS256, claims)
-    return token.SignedString([]byte(secret))
+type Claims struct {
+	UserID string `json:"user_id"`
+	Role   string `json:"role"`
+	jwt.RegisteredClaims
 }
 
-// GenerateTokenWithExpire generates token with custom expiration
-func GenerateTokenWithExpire(userID int64, username string, expire time.Duration, secret string) (string, error) {
-    claims := CustomClaims{
-        UserID:   userID,
-        Username: username,
-        StandardClaims: jwtv4.StandardClaims{
-            ExpiresAt: time.Now().Add(expire).Unix(),
-            IssuedAt:  time.Now().Unix(),
-        },
-    }
+func (c Claims) Validate() error {
+	if c.ExpiresAt == nil {
+		return errors.New("exp claim is required")
+	}
+	if c.Issuer != "identity-service" {
+		return errors.New("unexpected issuer")
+	}
+	if !slices.Contains(c.Audience, "public-api") {
+		return errors.New("unexpected audience")
+	}
+	return nil
+}
 
-    token := jwtv4.NewWithClaims(jwtv4.SigningMethodHS256, claims)
-    return token.SignedString([]byte(secret))
+func Server(secret []byte) middleware.Middleware {
+	keyFunc := func(token *jwt.Token) (any, error) {
+		return secret, nil
+	}
+
+	return kratosjwt.Server(
+		keyFunc,
+		kratosjwt.WithSigningMethod(jwt.SigningMethodHS256),
+		kratosjwt.WithClaims(func() jwt.Claims { return &Claims{} }),
+	)
 }
 ```
 
-## Whitelist with Selector
+For asymmetric signing, return the public key selected by `kid` and set the matching RSA or ECDSA signing method. The middleware checks that the parsed token method equals the configured method.
+
+Use separate keys and audiences for user tokens and service credentials. Rotate symmetric keys without embedding them in source or examples copied into production.
+
+## Read claims
+
+Treat missing or unexpected claims as authentication failures:
 
 ```go
-package server
+package auth
 
 import (
-    "github.com/go-kratos/kratos/v2/middleware/auth/jwt"
-    "github.com/go-kratos/kratos/v2/middleware/selector"
+	"context"
+
+	"github.com/go-kratos/kratos/v2/errors"
+	kratosjwt "github.com/go-kratos/kratos/v2/middleware/auth/jwt"
 )
 
-func NewHTTPServer(c *conf.Server, logger log.Logger) *http.Server {
-    // JWT middleware
-    authMiddleware := jwt.Server(
-        func(token *jwtv4.Token) (interface{}, error) {
-            return []byte("your-secret-key"), nil
-        },
-    )
+func Identity(ctx context.Context) (*Claims, error) {
+	claims, ok := kratosjwt.FromContext(ctx)
+	if !ok {
+		return nil, errors.Unauthorized("UNAUTHORIZED", "missing authentication claims")
+	}
 
-    var opts = []http.ServerOption{
-        http.Middleware(
-            recovery.Recovery(),
-            // Apply auth to all except whitelist paths
-            selector.Server(authMiddleware).
-                Match(func(ctx context.Context, operation string) bool {
-                    // Skip auth for login/register
-                    whitelist := []string{
-                        "/api/v1/auth/login",
-                        "/api/v1/auth/register",
-                        "/health",
-                        "/ready",
-                    }
-                    for _, path := range whitelist {
-                        if operation == path {
-                            return false // Skip middleware
-                        }
-                    }
-                    return true // Apply middleware
-                }).
-                Build(),
-            logging.Server(logger),
-        ),
-    }
-
-    return http.NewServer(opts...)
+	identity, ok := claims.(*Claims)
+	if !ok {
+		return nil, errors.Unauthorized("UNAUTHORIZED", "invalid authentication claims")
+	}
+	return identity, nil
 }
 ```
 
-## Complete Login Flow Example
+Authorize business actions in the biz layer using an explicit identity or policy interface. Keep transport token parsing in middleware or service adaptation.
+
+## Use client authentication
+
+`jwt.Client` signs a token from the configured claims for each outbound request:
 
 ```go
-package service
-
-type AuthService struct {
-    pb.UnimplementedAuthServer
-    uc  *biz.AuthUsecase
-    log *log.Helper
+claims := &jwt.RegisteredClaims{
+	Issuer:    "order-service",
+	Audience:  jwt.ClaimStrings{"user-service"},
+	ExpiresAt: jwt.NewNumericDate(time.Now().Add(2 * time.Minute)),
+	IssuedAt:  jwt.NewNumericDate(time.Now()),
 }
 
-func (s *AuthService) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginReply, error) {
-    // Validate credentials
-    user, err := s.uc.ValidateCredentials(ctx, req.Email, req.Password)
-    if err != nil {
-        return nil, errors.Unauthorized("INVALID_CREDENTIALS", "invalid email or password")
-    }
+middleware := kratosjwt.Client(
+	func(*jwt.Token) (any, error) { return serviceSecret, nil },
+	kratosjwt.WithSigningMethod(jwt.SigningMethodHS256),
+	kratosjwt.WithClaims(func() jwt.Claims { return claims }),
+)
+```
 
-    // Generate JWT token
-    token, err := auth.GenerateToken(user.ID, user.Name, s.jwtSecret)
-    if err != nil {
-        return nil, errors.InternalServer("TOKEN_ERROR", "failed to generate token")
-    }
+Use short-lived service credentials. For user-token forwarding, copy the incoming authorization header only across an explicitly trusted boundary and preserve cancellation and tracing context.
 
-    return &pb.LoginReply{
-        Token:     token,
-        ExpiresIn: 86400, // 24 hours
-        User: &pb.User{
-            Id:    user.ID,
-            Name:  user.Name,
-            Email: user.Email,
-        },
-    }, nil
-}
+## Select protected operations
 
-func (s *AuthService) GetProfile(ctx context.Context, req *pb.GetProfileRequest) (*pb.Profile, error) {
-    // Extract user from JWT
-    claims, ok := jwt.FromContext(ctx)
-    if !ok {
-        return nil, errors.Unauthorized("UNAUTHORIZED", "missing token")
-    }
+Kratos middleware selectors match the transport operation, commonly the generated RPC operation, not an assumed HTTP URL. Inspect generated handlers or runtime logs before writing the matcher:
 
-    customClaims := claims.(*CustomClaims)
+```go
+protected := selector.Server(Server(secret)).Match(
+	func(_ context.Context, operation string) bool {
+		switch operation {
+		case "/health.v1.Health/Check",
+			"/auth.v1.Auth/Login":
+			return false
+		default:
+			return true
+		}
+	},
+).Build()
+```
 
-    return s.uc.GetProfile(ctx, customClaims.UserID)
+Prefer an allowlist of public operations so newly added methods are protected by default.
+
+## Issue tokens
+
+Set registered claims and use the same algorithm policy as the server:
+
+```go
+func Issue(secret []byte, userID string, now time.Time) (string, error) {
+	claims := &Claims{
+		UserID: userID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "identity-service",
+			Audience:  jwt.ClaimStrings{"public-api"},
+			Subject:   userID,
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(secret)
 }
 ```
 
-## References
+Use refresh tokens or reauthentication for longer sessions. Avoid placing secrets or sensitive personal data in JWT claims because signed tokens are not encrypted.
 
-- [Kratos JWT Middleware](https://go-kratos.dev/docs/component/middleware/auth)
-- [JWT-Go](https://github.com/golang-jwt/jwt)
+## Verification
+
+Complete authentication work only when tests cover:
+
+- valid, expired, not-yet-valid, malformed, and wrong-algorithm tokens;
+- issuer and audience policy enforced by the service's claims validation;
+- missing and unexpected claims types;
+- public-operation matching and default protection of new operations;
+- key rotation or multiple key IDs when required; and
+- logs and errors that omit credentials and raw tokens.
+
+## Sources
+
+- [Kratos v2.9.2 JWT middleware](https://github.com/go-kratos/kratos/blob/v2.9.2/middleware/auth/jwt/jwt.go)
+- [golang-jwt v5](https://pkg.go.dev/github.com/golang-jwt/jwt/v5)
+- [JWT Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725)
