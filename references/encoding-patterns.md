@@ -1,253 +1,81 @@
 # Encoding Patterns
 
-This guide covers serialization and encoding in kratos.
+Read [compatibility.md](compatibility.md) before copying transport APIs. Start from generated Protobuf contracts and the repository's existing HTTP customization.
 
-## Overview
+## Contents
 
-Kratos provides a flexible encoding layer for serializing/deserializing request and response bodies. It supports multiple content types and allows custom encoders.
+- [Default behavior](#default-behavior)
+- [Custom codecs](#custom-codecs)
+- [HTTP customization](#http-customization)
+- [Boundary rules](#boundary-rules)
+- [Verification](#verification)
 
-## Default Encodings
+## Default Behavior
 
-Kratos supports these content types by default:
+Kratos selects registered codecs by content subtype. Generated gRPC services use Protobuf; generated HTTP handlers normally encode Protobuf messages through the transport's default request, response, and error codecs.
 
-| Content-Type | Codec | Description |
-|-------------|-------|-------------|
-| `application/json` | JSON | Default encoding |
-| `application/x-protobuf` | Protobuf | Binary protobuf encoding |
-| `application/x-www-form-urlencoded` | Form | Form data encoding |
-| `application/octet-stream` | Bytes | Raw bytes |
+Keep API responses as generated message types. Translate database entities and internal domain objects before returning from `internal/service`, so wire representation remains owned by the API contract.
 
-## Codec Interface
+## Custom Codecs
+
+A codec must be concurrency-safe and return a static, non-empty name:
 
 ```go
-package encoding
-
-// Codec defines the encoding interface
 type Codec interface {
-    // Marshal returns the wire format of v
-    Marshal(v interface{}) ([]byte, error)
-    // Unmarshal parses the wire format into v
-    Unmarshal(data []byte, v interface{}) error
-    // Name returns the name of the Codec
+    Marshal(any) ([]byte, error)
+    Unmarshal([]byte, any) error
     Name() string
 }
 ```
 
-## Using Custom Codec
-
-### Creating a Custom Codec
+Register a custom codec once during process initialization:
 
 ```go
-package encoding
-
-import (
-    "github.com/go-kratos/kratos/v2/encoding"
-    yaml "gopkg.in/yaml.v3"
-)
-
-// YAMLCodec implements encoding.Codec for YAML
 type YAMLCodec struct{}
 
-func (c *YAMLCodec) Marshal(v interface{}) ([]byte, error) {
-    return yaml.Marshal(v)
-}
-
-func (c *YAMLCodec) Unmarshal(data []byte, v interface{}) error {
+func (YAMLCodec) Name() string                  { return "yaml" }
+func (YAMLCodec) Marshal(v any) ([]byte, error) { return yaml.Marshal(v) }
+func (YAMLCodec) Unmarshal(data []byte, v any) error {
     return yaml.Unmarshal(data, v)
 }
 
-func (c *YAMLCodec) Name() string {
-    return "yaml"
-}
-```
-
-### Registering Custom Codec
-
-```go
-package main
-
-import (
-    "github.com/go-kratos/kratos/v2/encoding"
-)
-
 func init() {
-    // Register YAML codec
-    encoding.RegisterCodec(&YAMLCodec{})
+    encoding.RegisterCodec(YAMLCodec{})
 }
 ```
 
-### Server-Side Content Negotiation
+Registration is process-global and a duplicate lowercase name replaces the previous codec. Use a custom codec only when clients and media types are explicitly governed; JSON and Protobuf cover most service contracts.
+
+## HTTP Customization
+
+Customize generated HTTP behavior through server options:
 
 ```go
-package server
-
-import (
-    "github.com/go-kratos/kratos/v2/transport/http"
+server := http.NewServer(
+    http.RequestDecoder(decodeRequest),
+    http.ResponseEncoder(encodeResponse),
+    http.ErrorEncoder(encodeError),
 )
-
-func NewHTTPServer(c *conf.Server, logger log.Logger) *http.Server {
-    var opts = []http.ServerOption{
-        http.Address(c.Http.Addr),
-        // Request/Response encoding is automatic based on Content-Type
-        // Accept headers support: application/json, application/x-protobuf, etc.
-    }
-
-    return http.NewServer(opts...)
-}
 ```
 
-## HTTP Request/Response Encoding
+Wrap the defaults when only one behavior changes. A custom response envelope or error body is an API contract change: update OpenAPI, generated clients or gateways, compatibility tests, and consumers together.
 
-### Request Body Encoding
+Match `Content-Type` and `Accept` behavior explicitly. Reject unsupported media types and malformed input with stable Kratos errors; keep internal error details out of encoded responses.
 
-```go
-// Client request with specific encoding
-import (
-    "github.com/go-kratos/kratos/v2/encoding/json"
-)
+## Boundary Rules
 
-// Automatic based on Content-Type header
-// application/json -> JSON codec
-// application/x-protobuf -> Protobuf codec
-```
+- Define JSON names, enum representation, timestamps, optional fields, and unknown-field behavior in the contract.
+- Bound request bodies before decoding and use decoders with bounded allocation behavior.
+- Keep encoding deterministic when responses are signed, cached, or compared in tests.
+- Preserve HTTP status and Kratos error semantics when changing envelopes.
+- Test browser, gateway, and generated-client behavior for any non-default media type.
+- Keep secrets and raw internal errors out of serialization diagnostics.
 
-### Response Encoding
+## Verification
 
-```go
-package service
-
-import (
-    "github.com/go-kratos/kratos/v2/transport/http"
-)
-
-func (s *UserService) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, error) {
-    // Response encoding is automatic based on Accept header
-    // or request Content-Type (for POST/PUT)
-    return s.uc.GetUser(ctx, req.Id)
-}
-```
-
-## gRPC Encoding
-
-```go
-// gRPC uses protobuf encoding by default
-// Custom codec can be registered for specific content types
-
-package server
-
-import (
-    "github.com/go-kratos/kratos/v2/transport/grpc"
-)
-
-func NewGRPCServer(c *conf.Server, logger log.Logger) *grpc.Server {
-    var opts = []grpc.ServerOption{
-        grpc.Address(c.Grpc.Addr),
-        // gRPC always uses protobuf encoding for messages
-    }
-
-    return grpc.NewServer(opts...)
-}
-```
-
-## Form Encoding
-
-### Parsing Form Data
-
-```go
-package service
-
-import (
-    "github.com/go-kratos/kratos/v2/transport/http"
-    "github.com/go-kratos/kratos/v2/encoding/form"
-)
-
-type CreateUserForm struct {
-    Name  string `form:"name"`
-    Email string `form:"email"`
-    Age   int    `form:"age"`
-}
-
-func (s *UserService) CreateUserFromForm(ctx http.Context) error {
-    var form CreateUserForm
-    if err := ctx.Bind(&form); err != nil {
-        return err
-    }
-    // Process form data...
-}
-```
-
-### Form Codec Usage
-
-```go
-import (
-    "github.com/go-kratos/kratos/v2/encoding/form"
-)
-
-func main() {
-    // Marshal struct to form values
-    data := &CreateUserForm{
-        Name:  "John",
-        Email: "john@example.com",
-    }
-
-    // Encode to URL-encoded string
-    encoded, err := form.Marshal(data)
-    // "name=John&email=john%40example.com"
-
-    // Decode from form data
-    var decoded CreateUserForm
-    err = form.Unmarshal(encoded, &decoded)
-}
-```
-
-## Encoding Best Practices
-
-### ✅ Correct Usage
-
-```go
-// Use proto messages for API responses
-// They have built-in JSON and Protobuf codec support
-
-message User {
-    int64 id = 1;
-    string name = 2;
-    string email = 3;
-}
-
-// Kratos automatically handles encoding based on headers
-func (s *UserService) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, error) {
-    return &pb.User{
-        Id:    1,
-        Name:  "John",
-        Email: "john@example.com",
-    }, nil
-}
-```
-
-### ❌ Incorrect Usage
-
-```go
-// Don't return raw Go structs without codec support
-func (s *UserService) GetUser(ctx context.Context, req *pb.GetUserRequest) (*UserModel, error) {
-    // UserModel is a database model without proto definition
-    // Won't have proper encoding support
-    return &UserModel{}, nil
-}
-```
-
-### ✅ Custom Codec for Special Types
-
-```go
-// Register custom codec for special serialization needs
-func init() {
-    encoding.RegisterCodec(&MessagePackCodec{})
-}
-
-// Client can request via Accept: application/x-msgpack
-```
+Complete an encoding change when codec lookup and registration are tested, supported and unsupported content types behave explicitly, malformed and oversized input is bounded, success and error responses preserve the public contract, and generated HTTP and gRPC clients remain compatible.
 
 ## References
 
 - [Kratos Encoding](https://go-kratos.dev/docs/component/encoding)
-- [Protocol Buffers](https://developers.google.com/protocol-buffers)
-
+- [Kratos HTTP Transport](https://go-kratos.dev/docs/component/transport/http)

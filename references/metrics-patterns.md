@@ -1,165 +1,164 @@
 # Metrics Patterns
 
-This guide covers metrics collection with Prometheus in kratos.
+> Version-sensitive. Compare the target repository with the [compatibility baseline](compatibility.md). Kratos metrics middleware consumes OpenTelemetry instruments rather than Prometheus vector collectors.
 
-## Overview
+## Contents
 
-Kratos provides metrics middleware for collecting request metrics, compatible with Prometheus.
+- [Build the meter provider](#build-the-meter-provider)
+- [Create Kratos request instruments](#create-kratos-request-instruments)
+- [Expose Prometheus metrics](#expose-prometheus-metrics)
+- [Add business metrics](#add-business-metrics)
+- [Control cardinality](#control-cardinality)
+- [Verification](#verification)
 
-## Installation
+## Build the meter provider
 
-```bash
-go get github.com/go-kratos/kratos/v2/middleware/metrics
-go get github.com/prometheus/client_golang/prometheus
-```
-
-## Basic Usage
-
-### Server Metrics
+Reuse the repository's existing OpenTelemetry provider and exporter. For a Prometheus deployment, install an exporter version compatible with the repository's OTel SDK and register it as a reader:
 
 ```go
-package server
+package telemetry
 
 import (
-    "github.com/go-kratos/kratos/v2/middleware/metrics"
-    "github.com/go-kratos/kratos/v2/transport/http"
-    "github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
-func NewHTTPServer(c *conf.Server, logger log.Logger) *http.Server {
-    // Create metrics collectors
-    requestDuration := prometheus.NewHistogramVec(
-        prometheus.HistogramOpts{
-            Name:    "http_request_duration_seconds",
-            Help:    "HTTP request duration in seconds",
-            Buckets: prometheus.DefBuckets,
-        },
-        []string{"method", "path"},
-    )
+func NewMeterProvider() (*sdkmetric.MeterProvider, error) {
+	exporter, err := prometheus.New()
+	if err != nil {
+		return nil, err
+	}
 
-    requestCount := prometheus.NewCounterVec(
-        prometheus.CounterOpts{
-            Name: "http_request_total",
-            Help: "Total number of HTTP requests",
-        },
-        []string{"method", "path", "status"},
-    )
-
-    // Register collectors
-    prometheus.MustRegister(requestDuration, requestCount)
-
-    var opts = []http.ServerOption{
-        http.Middleware(
-            recovery.Recovery(),
-            metrics.Server(
-                metrics.WithSeconds(requestDuration),
-                metrics.WithRequests(requestCount),
-            ),
-            logging.Server(logger),
-        ),
-    }
-
-    return http.NewServer(opts...)
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(exporter),
+	)
+	otel.SetMeterProvider(provider)
+	return provider, nil
 }
 ```
 
-### Metrics Endpoint
+Create one provider during application startup, inject it where needed, and shut it down with a bounded context. Do not create providers or register exporters per request.
+
+## Create Kratos request instruments
+
+Kratos supplies helpers with the expected OpenTelemetry types:
 
 ```go
-package server
+package telemetry
 
 import (
-    "github.com/gorilla/mux"
-    "github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/metric"
+
+	kratosmetrics "github.com/go-kratos/kratos/v2/middleware/metrics"
+	"github.com/go-kratos/kratos/v2/middleware"
 )
 
-// Add metrics route
-func NewMetricsServer(addr string) *http.Server {
-    router := mux.NewRouter()
-    router.Handle("/metrics", promhttp.Handler())
+func ServerMetrics(meter metric.Meter) (middleware.Middleware, error) {
+	requests, err := kratosmetrics.DefaultRequestsCounter(
+		meter,
+		kratosmetrics.DefaultServerRequestsCounterName,
+	)
+	if err != nil {
+		return nil, err
+	}
 
-    return &http.Server{
-        Addr:    addr,
-        Handler: router,
-    }
+	seconds, err := kratosmetrics.DefaultSecondsHistogram(
+		meter,
+		kratosmetrics.DefaultServerSecondsHistogramName,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return kratosmetrics.Server(
+		kratosmetrics.WithRequests(requests),
+		kratosmetrics.WithSeconds(seconds),
+	), nil
 }
 ```
 
-## Custom Metrics
+Use `kratosmetrics.Client` and the client metric names for outbound transport metrics. Install the middleware on the correct side and keep operation names stable.
 
-### Counter
+When explicit histogram boundaries are required, register the matching view before creating instruments:
 
 ```go
-var (
-    userCreatedCounter = prometheus.NewCounterVec(
-        prometheus.CounterOpts{
-            Name: "user_created_total",
-            Help: "Total number of users created",
-        },
-        []string{"source"},
-    )
+view := kratosmetrics.DefaultSecondsHistogramView(
+	kratosmetrics.DefaultServerSecondsHistogramName,
 )
-
-func init() {
-    prometheus.MustRegister(userCreatedCounter)
-}
-
-func (uc *UserUsecase) CreateUser(ctx context.Context, u *User) (*User, error) {
-    // ... create user
-
-    userCreatedCounter.WithLabelValues("api").Inc()
-
-    return user, nil
-}
+provider := sdkmetric.NewMeterProvider(
+	sdkmetric.WithReader(exporter),
+	sdkmetric.WithView(view),
+)
 ```
 
-### Gauge
+## Expose Prometheus metrics
+
+The OTel Prometheus exporter registers a collector with the configured Prometheus registerer. Expose the registry through a dedicated operational endpoint:
 
 ```go
-var (
-    activeConnections = prometheus.NewGaugeVec(
-        prometheus.GaugeOpts{
-            Name: "active_connections",
-            Help: "Number of active connections",
-        },
-        []string{"service"},
-    )
+package telemetry
+
+import (
+	"net/http"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-func (s *Server) handleConnection(conn net.Conn) {
-    activeConnections.WithLabelValues("grpc").Inc()
-    defer activeConnections.WithLabelValues("grpc").Dec()
-
-    // ... handle connection
+func Handler() http.Handler {
+	return promhttp.Handler()
 }
 ```
 
-### Histogram
+Keep the metrics endpoint outside public API authentication when infrastructure must scrape it, but protect it with network policy or dedicated operational authentication.
+
+## Add business metrics
+
+Create business instruments from the same provider:
 
 ```go
-var (
-    dbQueryDuration = prometheus.NewHistogramVec(
-        prometheus.HistogramOpts{
-            Name:    "db_query_duration_seconds",
-            Help:    "Database query duration in seconds",
-            Buckets: []float64{0.001, 0.01, 0.1, 0.5, 1, 2, 5},
-        },
-        []string{"operation", "table"},
-    )
+created, err := meter.Int64Counter(
+	"users_created",
+	metric.WithDescription("Number of users successfully created"),
+	metric.WithUnit("{user}"),
 )
-
-func (r *userRepo) GetByID(ctx context.Context, id int64) (*User, error) {
-    start := time.Now()
-    defer func() {
-        dbQueryDuration.WithLabelValues("select", "user").Observe(time.Since(start).Seconds())
-    }()
-
-    // ... query database
+if err != nil {
+	return err
 }
+
+created.Add(ctx, 1, metric.WithAttributes(
+	attribute.String("source", source),
+))
 ```
 
-## References
+Record a counter only after the business operation succeeds. Record latency with histograms and current values with observable gauges or up-down counters, following the SDK version already in the repository.
 
-- [Kratos Metrics](https://go-kratos.dev/docs/component/metrics)
-- [Prometheus Go Client](https://github.com/prometheus/client_golang)
-- [Prometheus Best Practices](https://prometheus.io/docs/practices/naming/)
+## Control cardinality
+
+Use bounded attributes such as transport kind, generated operation, status code, error reason, region, and deployment environment.
+
+Exclude identifiers with unbounded values:
+
+- user, order, request, trace, and session IDs;
+- raw URL paths containing resource IDs;
+- complete error messages; and
+- arbitrary client-supplied headers.
+
+Prefer the generated Kratos operation over the raw HTTP path. Keep the error reason vocabulary finite and owned by the service contract.
+
+## Verification
+
+Complete metrics work only when:
+
+- the provider and exporter versions match the target `go.mod`;
+- request counter and duration histogram types compile against Kratos;
+- success and representative failure paths emit expected attributes;
+- `/metrics` or the selected exporter produces data in the deployed environment;
+- label cardinality is bounded; and
+- provider shutdown is wired into application cleanup.
+
+## Sources
+
+- [Kratos v2.9.2 metrics middleware](https://github.com/go-kratos/kratos/blob/v2.9.2/middleware/metrics/metrics.go)
+- [OpenTelemetry Go metrics](https://opentelemetry.io/docs/languages/go/instrumentation/#metrics)
+- [OpenTelemetry Prometheus exporter](https://pkg.go.dev/go.opentelemetry.io/otel/exporters/prometheus)

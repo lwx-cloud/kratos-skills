@@ -1,352 +1,132 @@
 # Selector Patterns
 
-This guide covers load balancing and node selection in kratos.
+> Version-sensitive. Compare selector APIs with the [compatibility baseline](compatibility.md) before applying examples.
 
-## Overview
+## Contents
 
-Selector provides client-side load balancing for service discovery. It selects the most appropriate service instance from multiple available nodes.
+- [Understand the client path](#understand-the-client-path)
+- [Choose a selector](#choose-a-selector)
+- [Filter discovered nodes](#filter-discovered-nodes)
+- [Implement a custom selector](#implement-a-custom-selector)
+- [Verification](#verification)
 
-## Selector Interface
+## Understand the client path
+
+In the compile-tested baseline, Kratos discovery clients use the global `selector.Builder` to create a selector for each client:
+
+- WRR is the default selector;
+- `selector.SetGlobalSelector` accepts a `selector.Builder`, not a constructed selector;
+- HTTP and gRPC clients expose `WithNodeFilter`;
+- HTTP and gRPC clients do not expose `WithSelector`; and
+- a custom selector implements `Select` plus `Apply`, normally through a builder.
+
+Configure the global builder before constructing clients. Treat changing it as process-wide behavior.
+
+## Choose a selector
+
+Keep the default WRR unless measurements justify another strategy:
 
 ```go
-package selector
+package balancing
 
 import (
-    "context"
+	"github.com/go-kratos/kratos/v2/selector"
+	"github.com/go-kratos/kratos/v2/selector/p2c"
 )
 
-// Selector is the load balancer
+func UseP2C() {
+	selector.SetGlobalSelector(p2c.NewBuilder())
+}
+```
+
+Available builders in the baseline include:
+
+```go
+selector.SetGlobalSelector(wrr.NewBuilder())
+selector.SetGlobalSelector(p2c.NewBuilder())
+selector.SetGlobalSelector(random.NewBuilder())
+```
+
+Use one process-wide choice unless the repository already provides a deliberate per-client integration through lower-level gRPC options. Avoid changing global selection inside request handling or after clients are constructed.
+
+## Filter discovered nodes
+
+Filters run in the order supplied and narrow the discovery result before balancing:
+
+```go
+package client
+
+import (
+	"context"
+
+	"github.com/go-kratos/kratos/v2/registry"
+	"github.com/go-kratos/kratos/v2/selector"
+	selectorfilter "github.com/go-kratos/kratos/v2/selector/filter"
+	kratosgrpc "github.com/go-kratos/kratos/v2/transport/grpc"
+	"google.golang.org/grpc"
+)
+
+func NewClient(ctx context.Context, discovery registry.Discovery) (*grpc.ClientConn, error) {
+	return kratosgrpc.DialInsecure(
+		ctx,
+		kratosgrpc.WithEndpoint("discovery:///user-service"),
+		kratosgrpc.WithDiscovery(discovery),
+		kratosgrpc.WithNodeFilter(
+			selectorfilter.Version("v2"),
+			func(_ context.Context, nodes []selector.Node) []selector.Node {
+				selected := make([]selector.Node, 0, len(nodes))
+				for _, node := range nodes {
+					if node.Metadata()["region"] == "cn-east" {
+						selected = append(selected, node)
+					}
+				}
+				return selected
+			},
+		),
+	)
+}
+```
+
+Use the generated RPC operation and discovery metadata as observed in the target system. An empty result produces `selector.ErrNoAvailable`, so expose filter mismatches through logs or metrics.
+
+## Implement a custom selector
+
+Prefer the built-in builders. A custom implementation must satisfy the current interfaces:
+
+```go
 type Selector interface {
-    // Select returns a suitable Node based on the strategy
-    Select(ctx context.Context, opts ...SelectOption) (selected Node, done DoneFunc, err error)
-    // Update updates the available Nodes
-    Update(nodes []Node) error
+	Select(context.Context, ...SelectOption) (Node, DoneFunc, error)
+	Apply([]Node)
 }
 
-// Node represents a service instance
-type Node interface {
-    // Address is the service address
-    Address() string
-    // ServiceName is the service name
-    ServiceName() string
-    // InitialWeight returns the initial weight
-    InitialWeight() *int64
-    // Version is the service version
-    Version() string
-    // Metadata is the service metadata
-    Metadata() map[string]string
+type Builder interface {
+	Build() Selector
 }
 ```
 
-## Built-in Selectors
+Start from `selector.DefaultBuilder` when only the balancing algorithm or weighted-node model changes. Implement the lower-level `selector.Balancer` or `selector.WeightedNodeBuilder` instead of recreating discovery updates, filters, peer context, and done callbacks.
 
-### Random Selector
+Preserve these invariants:
 
-Randomly selects a node from available instances.
+- `Apply` atomically replaces or reconciles the current node view;
+- `Select` applies every `SelectOption`, including node filters;
+- successful selection returns both a node and a non-nil done callback;
+- the done callback receives the request result exactly once; and
+- concurrent `Apply` and `Select` calls are safe.
 
-```go
-package client
+## Verification
 
-import (
-    "github.com/go-kratos/kratos/v2/selector/random"
-    "github.com/go-kratos/kratos/v2/transport/grpc"
-)
+Complete selector work only when:
 
-func NewGRPCClient() (*grpc.Client, error) {
-    return grpc.DialInsecure(
-        context.Background(),
-        grpc.WithEndpoint("discovery:///user-service"),
-        grpc.WithDiscovery(discovery),
-        grpc.WithNodeFilter(func(ctx context.Context, nodes []selector.Node) []selector.Node {
-            // Filter nodes by version or metadata
-            var filtered []selector.Node
-            for _, n := range nodes {
-                if n.Version() == "v1.0.0" {
-                    filtered = append(filtered, n)
-                }
-            }
-            return filtered
-        }),
-    )
-}
-```
+- the selected builder matches the installed Kratos version;
+- discovery produces nodes with the metadata used by filters;
+- empty and partially healthy node sets are tested;
+- the chosen selector is configured before client construction; and
+- client calls report the selected peer and feed completion results back to the selector.
 
-### Weighted Random Selector
+## Sources
 
-Selects nodes based on assigned weights.
-
-```go
-package client
-
-import (
-    "github.com/go-kratos/kratos/v2/selector/weighted"
-)
-
-func NewGRPCClient() (*grpc.Client, error) {
-    return grpc.DialInsecure(
-        context.Background(),
-        grpc.WithEndpoint("discovery:///user-service"),
-        grpc.WithDiscovery(discovery),
-        // Uses weighted selector by default with weighted.New()
-    )
-}
-```
-
-### P2C (Power of Two Choices)
-
-Selects the better of two randomly chosen nodes based on load.
-
-```go
-package client
-
-import (
-    "github.com/go-kratos/kratos/v2/selector/p2c"
-)
-
-func NewGRPCClient() (*grpc.Client, error) {
-    return grpc.DialInsecure(
-        context.Background(),
-        grpc.WithEndpoint("discovery:///user-service"),
-        grpc.WithDiscovery(discovery),
-        grpc.WithSelector(p2c.New()),
-    )
-}
-```
-
-### WRR (Weighted Round Robin)
-
-Selects nodes in a round-robin fashion respecting weights.
-
-```go
-package client
-
-import (
-    "github.com/go-kratos/kratos/v2/selector/wrr"
-)
-
-func NewGRPCClient() (*grpc.Client, error) {
-    return grpc.DialInsecure(
-        context.Background(),
-        grpc.WithEndpoint("discovery:///user-service"),
-        grpc.WithDiscovery(discovery),
-        grpc.WithSelector(wrr.New()),
-    )
-}
-```
-
-## Node Filtering
-
-### Custom Node Filter
-
-```go
-package client
-
-import (
-    "github.com/go-kratos/kratos/v2/selector"
-)
-
-// FilterByVersion filters nodes by version
-func FilterByVersion(version string) selector.NodeFilter {
-    return func(ctx context.Context, nodes []selector.Node) []selector.Node {
-        var filtered []selector.Node
-        for _, n := range nodes {
-            if n.Version() == version {
-                filtered = append(filtered, n)
-            }
-        }
-        return filtered
-    }
-}
-
-// FilterByMetadata filters nodes by metadata
-func FilterByMetadata(key, value string) selector.NodeFilter {
-    return func(ctx context.Context, nodes []selector.Node) []selector.Node {
-        var filtered []selector.Node
-        for _, n := range nodes {
-            if v, ok := n.Metadata()[key]; ok && v == value {
-                filtered = append(filtered, n)
-            }
-        }
-        return filtered
-    }
-}
-
-func NewGRPCClient() (*grpc.Client, error) {
-    return grpc.DialInsecure(
-        context.Background(),
-        grpc.WithEndpoint("discovery:///user-service"),
-        grpc.WithDiscovery(discovery),
-        grpc.WithNodeFilter(
-            FilterByVersion("v1.0.0"),
-            FilterByMetadata("region", "us-west"),
-        ),
-    )
-}
-```
-
-## Custom Selector
-
-### Building a Custom Selector
-
-```go
-package selector
-
-import (
-    "context"
-    "sync"
-
-    "github.com/go-kratos/kratos/v2/selector"
-)
-
-// LeastConnectionsSelector selects the node with least active connections
-type LeastConnectionsSelector struct {
-    nodes []selector.Node
-    conns map[string]int
-    mu    sync.RWMutex
-}
-
-func NewLeastConnections() selector.Selector {
-    return &LeastConnectionsSelector{
-        conns: make(map[string]int),
-    }
-}
-
-func (s *LeastConnectionsSelector) Select(ctx context.Context, opts ...selector.SelectOption) (selector.Node, selector.DoneFunc, error) {
-    s.mu.RLock()
-    defer s.mu.RUnlock()
-
-    if len(s.nodes) == 0 {
-        return nil, nil, selector.ErrNoAvailable
-    }
-
-    // Find node with least connections
-    var selected selector.Node
-    minConns := int(^uint(0) >> 1) // Max int
-
-    for _, n := range s.nodes {
-        if conns := s.conns[n.Address()]; conns < minConns {
-            minConns = conns
-            selected = n
-        }
-    }
-
-    // Increment connection count
-    s.mu.RUnlock()
-    s.mu.Lock()
-    s.conns[selected.Address()]++
-    s.mu.Unlock()
-    s.mu.RLock()
-
-    done := func(ctx context.Context, di selector.DoneInfo) {
-        s.mu.Lock()
-        s.conns[selected.Address()]--
-        s.mu.Unlock()
-    }
-
-    return selected, done, nil
-}
-
-func (s *LeastConnectionsSelector) Update(nodes []selector.Node) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    s.nodes = nodes
-    return nil
-}
-```
-
-## Using with HTTP Client
-
-```go
-package client
-
-import (
-    "github.com/go-kratos/kratos/v2/transport/http"
-    "github.com/go-kratos/kratos/v2/selector/random"
-)
-
-func NewHTTPClient() (*http.Client, error) {
-    return http.NewClient(
-        context.Background(),
-        http.WithEndpoint("discovery:///user-service"),
-        http.WithDiscovery(discovery),
-        http.WithSelector(random.New()),
-    )
-}
-```
-
-## Balancer Builder
-
-```go
-package client
-
-import (
-    "github.com/go-kratos/kratos/v2/selector"
-    "github.com/go-kratos/kratos/v2/transport/grpc"
-    "google.golang.org/grpc/balancer"
-)
-
-// Custom balancer name
-const Name = "custom_balancer"
-
-func init() {
-    // Register custom balancer
-    selector.SetGlobalSelector(NewLeastConnections())
-}
-
-func NewGRPCClient() (*grpc.Client, error) {
-    return grpc.DialInsecure(
-        context.Background(),
-        grpc.WithEndpoint("discovery:///user-service"),
-        grpc.WithDiscovery(discovery),
-        grpc.WithBalancerName(Name),
-    )
-}
-```
-
-## Best Practices
-
-### ✅ Use P2C for Production
-
-```go
-// P2C provides good load balancing with minimal overhead
-import "github.com/go-kratos/kratos/v2/selector/p2c"
-
-client, err := grpc.DialInsecure(
-    context.Background(),
-    grpc.WithEndpoint("discovery:///service"),
-    grpc.WithDiscovery(discovery),
-    grpc.WithSelector(p2c.New()),
-)
-```
-
-### ✅ Filter Nodes Before Selection
-
-```go
-// Filter out unhealthy or unwanted nodes before selection
-grpc.WithNodeFilter(
-    func(ctx context.Context, nodes []selector.Node) []selector.Node {
-        // Only select healthy nodes
-        var healthy []selector.Node
-        for _, n := range nodes {
-            if n.Metadata()["health"] == "healthy" {
-                healthy = append(healthy, n)
-            }
-        }
-        return healthy
-    },
-)
-```
-
-### ❌ Don't Use Random in Production
-
-```go
-// Avoid pure random for production - it doesn't consider node health
-// Use P2C or WRR instead
-grpc.WithSelector(random.New()) // ❌ Not recommended for production
-```
-
-## References
-
-- [Kratos Selector](https://go-kratos.dev/docs/component/selector)
-- [Load Balancing](https://go-kratos.dev/docs/guide/load-balance)
-
+- [Kratos v2.9.2 selector interfaces](https://github.com/go-kratos/kratos/blob/v2.9.2/selector/selector.go)
+- [Kratos v2.9.2 global selector](https://github.com/go-kratos/kratos/blob/v2.9.2/selector/global.go)
+- [Kratos v2.9.2 gRPC client options](https://github.com/go-kratos/kratos/blob/v2.9.2/transport/grpc/client.go)
+- [Kratos v2.9.2 default selector](https://github.com/go-kratos/kratos/blob/v2.9.2/selector/default_selector.go)

@@ -1,194 +1,57 @@
 # Kratos Skills
 
-Comprehensive knowledge base for go-kratos microservices framework.
-
-[![GitHub](https://img.shields.io/github/license/lwx-cloud/kratos-skills)](LICENSE)
-[![Kratos](https://img.shields.io/badge/kratos-v2.0+-blue.svg)](https://go-kratos.dev/)
+Repository-aware Go-Kratos v2 engineering skill for implementation, migration, debugging, and review.
 
 [English](README.md) | [简体中文](README_CN.md)
 
-> **Note**: This skill follows the [Agent Skills specification](https://github.com/anthropics/skills/) format, inspired by [zero-skills](https://github.com/zeromicro/zero-skills).
+## What It Provides
 
----
+- A compact workflow in [SKILL.md](SKILL.md) with distinct implementation, staged migration, causal debugging, and review branches.
+- Focused references for APIs, architecture, middleware, resilience, observability, persistence, and generation.
+- A compile-tested dependency baseline in [references/compatibility.md](references/compatibility.md).
+- Static documentation checks and pinned Go API compilation through `scripts/check.sh`.
 
-## Quick Install
+The skill inventories target versions and affected boundaries first, then routes only to references relevant to the task.
 
-### Via skills CLI (Recommended)
+## Install
 
-```bash
-# Project-level (recommended)
-npx skills add lwx-cloud/kratos-skills
-
-# Personal-level (all projects)
-npx skills add lwx-cloud/kratos-skills -g
-```
-
-### Or ask your AI agent
-
-```
-Install kratos-skills from https://github.com/lwx-cloud/kratos-skills
-```
-
-### Or manually
+With the skills CLI:
 
 ```bash
-# Project-level
-git clone https://github.com/lwx-cloud/kratos-skills.git .claude/skills/kratos-skills
-
-# Personal-level
-git clone https://github.com/lwx-cloud/kratos-skills.git ~/.claude/skills/kratos-skills
+npx skills add laxidou/kratos-skills
 ```
 
-## Overview
+For local development, link this checkout so edits remain live:
 
-Kratos Skills is a comprehensive knowledge base designed for AI agents and developers working with the [go-kratos](https://go-kratos.dev/) microservices framework. It provides production-ready patterns, best practices, and troubleshooting guides for building scalable, maintainable microservices.
-
-### Key Features
-
-- **21 Pattern Guides**: Covering API design, architecture, resilience, observability, and more
-- **DDD Layered Architecture**: Service → Biz → Data with clean separation of concerns
-- **Protobuf-First**: API definitions with automatic HTTP/gRPC code generation
-- **Wire DI**: Compile-time dependency injection without runtime overhead
-- **Production-Ready**: Circuit breakers, rate limiting, distributed tracing, metrics
-
-## Quick Start
-
-### For Claude Code Users
-
-This skill loads automatically when working with kratos projects. Invoke with:
-
-```
-/kratos-skills
+```bash
+mkdir -p ~/.codex/skills
+ln -s "$(pwd)" ~/.codex/skills/kratos-skills
 ```
 
-Or ask directly:
-```
-"Create a new user service with CRUD operations using kratos"
-```
+Claude Code users may link the same checkout under `~/.claude/skills/kratos-skills`. See [getting-started/claude-code-guide.md](getting-started/claude-code-guide.md) for platform-specific discovery and invocation details.
 
-### For Other AI Assistants
+## Use
 
-Reference the pattern guides in [references/](references/) directory for specific topics.
+Invoke `$kratos-skills` explicitly or ask for a Kratos repository task, for example:
 
-## Repository Structure
-
-```
-kratos-skills/
-├── SKILL.md                          # Main skill configuration for Claude Code
-├── README.md                         # This file
-├── README_CN.md                      # Chinese version
-├── references/                       # Pattern guides (21 topics)
-│   ├── api-patterns.md              # REST/gRPC API design
-│   ├── transport-patterns.md        # HTTP/gRPC server & client
-│   ├── architecture-patterns.md     # DDD layered architecture
-│   ├── error-patterns.md            # Error handling & codes
-│   ├── middleware-patterns.md       # Middleware chain & custom middleware
-│   ├── config-patterns.md           # Configuration management
-│   ├── registry-patterns.md         # Service discovery (etcd, consul, nacos)
-│   ├── selector-patterns.md         # Load balancing algorithms
-│   ├── circuit-breaker-patterns.md  # Fault tolerance & resilience
-│   ├── ratelimit-patterns.md        # Rate limiting & throttling
-│   ├── recovery-patterns.md         # Panic recovery
-│   ├── auth-patterns.md             # JWT authentication
-│   ├── validate-patterns.md         # Request validation (protovalidate)
-│   ├── logging-patterns.md          # Structured logging
-│   ├── metrics-patterns.md          # Prometheus metrics
-│   ├── tracing-patterns.md          # OpenTelemetry tracing
-│   ├── metadata-patterns.md         # Context propagation
-│   ├── encoding-patterns.md         # Serialization & codecs
-│   ├── ent-patterns.md              # Ent ORM integration
-│   ├── cli-guide.md                 # Kratos CLI usage
-│   └── openapi-guide.md             # OpenAPI documentation
-├── best-practices/
-│   └── overview.md                  # Production best practices
-├── troubleshooting/
-│   └── common-issues.md             # Common problems & solutions
-└── getting-started/
-    └── claude-code-guide.md         # Claude Code integration
+```text
+Use $kratos-skills to migrate request validation to Protovalidate and verify generated code.
 ```
 
-## Core Concepts
-
-### Layered Architecture
-
-```
-┌─────────────────────────────────────────┐
-│  Service Layer   (API/Transport)        │  ← HTTP/gRPC handlers
-│  - Request validation                   │
-│  - Response serialization               │
-├─────────────────────────────────────────┤
-│  Biz Layer       (Business Logic)       │  ← Use cases
-│  - Business rules                       │
-│  - Workflow orchestration               │
-├─────────────────────────────────────────┤
-│  Data Layer      (Persistence)          │  ← Repository implementation
-│  - Database operations                  │
-│  - Cache integration                    │
-└─────────────────────────────────────────┘
+```text
+Review this Kratos service's middleware order, error mapping, and shutdown behavior.
 ```
 
-### Key Principles
+The root skill selects the appropriate branch and reference files. Read [best-practices/overview.md](best-practices/overview.md) for a broad production-readiness review or [troubleshooting/common-issues.md](troubleshooting/common-issues.md) for cross-cutting diagnosis.
 
-✅ **Always Follow**
-- Layer separation: Service → Biz → Data
-- Dependency Inversion: Interfaces in biz, implementations in data
-- Protobuf-first: Define APIs in `.proto` files
-- Wire injection: Compile-time dependency injection
-- Context propagation: Pass `ctx` through all layers
+## Validate Changes
 
-❌ **Never Do**
-- Put business logic in service handlers
-- Skip interface definitions
-- Use global variables for dependencies
-- Hard-code configuration values
-- Modify generated `.pb.go` files
-
-## Usage Examples
-
-### Creating a Service
-
-```
-"Create a user service with:
-- CreateUser, GetUser, UpdateUser, DeleteUser APIs
-- MySQL storage with Ent ORM
-- JWT authentication
-- Request validation"
+```bash
+scripts/check.sh
 ```
 
-### Adding Middleware
-
-```
-"Add circuit breaker and rate limiting middleware to my kratos service"
-```
-
-### Configuring Service Discovery
-
-```
-"Setup etcd service discovery with client-side load balancing"
-```
-
-## Migration Guides
-
-### From proto-gen-validate to Protovalidate
-
-The validation patterns have been updated to use [protovalidate](https://github.com/bufbuild/protovalidate) instead of the deprecated proto-gen-validate. See [references/validate-patterns.md](references/validate-patterns.md) for migration details.
-
-## Documentation
-
-- **Official Kratos Docs**: https://go-kratos.dev/
-- **Kratos Layout**: https://github.com/go-kratos/kratos-layout
-- **Examples**: https://github.com/go-kratos/examples
-- **Protovalidate**: https://buf.build/docs/protovalidate/
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
+The command validates skill metadata, Markdown structure and anchors, routed references, pinned source versions, and known stale APIs, then compiles the pinned API baseline and runs `go vet`.
 
 ## License
 
 [MIT](LICENSE)
-
----
-
-**Maintained by**: [lwx-cloud](https://github.com/lwx-cloud)
-**Status**: Actively maintained

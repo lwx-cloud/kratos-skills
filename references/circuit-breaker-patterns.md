@@ -1,369 +1,129 @@
 # Circuit Breaker Patterns
 
-This guide covers circuit breaker patterns for fault tolerance in kratos.
+> Version-sensitive. Compare the target repository with the [compatibility baseline](compatibility.md). The compile-tested middleware is client-side and groups breakers by operation.
 
-## Overview
+## Contents
 
-Circuit breaker prevents cascading failures in distributed systems. When a service is failing, the circuit breaker opens to fail fast, preventing resource exhaustion.
+- [Place the breaker](#place-the-breaker)
+- [Use the default breaker](#use-the-default-breaker)
+- [Configure Aegis SRE](#configure-aegis-sre)
+- [Control failure classification](#control-failure-classification)
+- [Design fallback behavior](#design-fallback-behavior)
+- [Verification](#verification)
 
-Kratos uses [Aegis](https://github.com/go-kratos/aegis) for circuit breaker algorithms.
+## Place the breaker
 
-## Circuit Breaker States
+Install `circuitbreaker.Client` on outbound calls to unstable dependencies. The compile-tested baseline exposes the breaker on the client side.
 
-```
-┌─────────────┐     Failure Threshold      ┌─────────────┐
-│   CLOSED    │ ─────────────────────────▶ │    OPEN     │
-│  (Normal)   │                            │ (Failing)   │
-└─────────────┘                            └─────────────┘
-       ▲                                           │
-       │        Timeout/Success                   │
-       └───────────────────────────────────────────┘
-                          │
-                          ▼
-                   ┌─────────────┐
-                   │  HALF-OPEN  │
-                   │  (Testing)  │
-                   └─────────────┘
-```
+The middleware creates a breaker per client operation and records:
 
-- **CLOSED**: Normal operation, requests pass through
-- **OPEN**: Failure threshold reached, requests fail fast
-- **HALF-OPEN**: Testing if service recovered
+- internal-server errors;
+- service-unavailable errors; and
+- gateway-timeout errors.
 
-## Installation
+Other results count as success. This classification makes domain-to-Kratos error mapping part of breaker behavior.
 
-```bash
-go get github.com/go-kratos/kratos/v2/middleware/circuitbreaker
-go get github.com/go-kratos/aegis/circuitbreaker
-```
+## Use the default breaker
 
-## Client-Side Circuit Breaker
-
-### Basic Usage
+The default middleware uses an Aegis SRE breaker:
 
 ```go
 package client
 
 import (
-    "github.com/go-kratos/kratos/v2/middleware/circuitbreaker"
-    "github.com/go-kratos/kratos/v2/transport/grpc"
-    "github.com/go-kratos/aegis/circuitbreaker/sre"
+	"context"
+
+	"github.com/go-kratos/kratos/v2/middleware/circuitbreaker"
+	kratosgrpc "github.com/go-kratos/kratos/v2/transport/grpc"
 )
 
-func main() {
-    // Create circuit breaker
-    breaker := sre.NewBreaker()
-
-    // Create gRPC client with circuit breaker
-    conn, err := grpc.DialInsecure(
-        context.Background(),
-        grpc.WithEndpoint("discovery:///helloworld"),
-        grpc.WithMiddleware(
-            circuitbreaker.Client(
-                circuitbreaker.WithBreaker(breaker),
-            ),
-        ),
-    )
-    if err != nil {
-        panic(err)
-    }
-    defer conn.Close()
+func Dial(ctx context.Context, endpoint string) error {
+	conn, err := kratosgrpc.DialInsecure(
+		ctx,
+		kratosgrpc.WithEndpoint(endpoint),
+		kratosgrpc.WithMiddleware(circuitbreaker.Client()),
+	)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
 }
 ```
 
-### SRE Circuit Breaker (Google SRE)
+Place tracing and metrics outside the breaker when locally rejected calls must still be visible. Place retries deliberately: retrying outside the breaker records each attempt, while retrying inside can hide attempt-level failures from the breaker.
+
+## Configure Aegis SRE
+
+Use `WithCircuitBreaker` to construct one breaker for each operation group entry:
 
 ```go
-import "github.com/go-kratos/aegis/circuitbreaker/sre"
-
-// Default SRE breaker
-breaker := sre.NewBreaker()
-
-// Custom configuration
-breaker := sre.NewBreaker(
-    // Success rate threshold (0-1)
-    sre.WithSuccessThreshold(0.5),
-
-    // Request volume threshold
-    sre.WithRequestVolume(100),
-
-    // Bucket size in seconds
-    sre.WithBucketSize(10),
-
-    // Window size
-    sre.WithWindow(time.Second * 10),
-)
-```
-
-### Configuration Options
-
-```go
-// With custom error filter (only certain errors trigger breaker)
-circuitbreaker.Client(
-    circuitbreaker.WithBreaker(breaker),
-    circuitbreaker.WithFilter(func(err error) bool {
-        // Return true to count as failure
-        if errors.Is(err, context.DeadlineExceeded) {
-            return true
-        }
-        // Don't trigger on 4xx errors
-        if kratosErr := errors.FromError(err); kratosErr != nil {
-            return kratosErr.Code >= 500
-        }
-        return false
-    }),
-)
-```
-
-## Server-Side Circuit Breaker
-
-```go
-import (
-    "github.com/go-kratos/kratos/v2/middleware/circuitbreaker"
-    "github.com/go-kratos/kratos/v2/transport/http"
-)
-
-func NewHTTPServer(c *conf.Server, logger log.Logger) *http.Server {
-    // Server-side breaker (protects the server)
-    breaker := sre.NewBreaker()
-
-    var opts = []http.ServerOption{
-        http.Middleware(
-            recovery.Recovery(),
-            circuitbreaker.Server(
-                circuitbreaker.WithBreaker(breaker),
-            ),
-            logging.Server(logger),
-        ),
-    }
-
-    return http.NewServer(opts...)
-}
-```
-
-## Group Circuit Breaker
-
-Share circuit breaker across multiple clients:
-
-```go
-package breaker
+package resilience
 
 import (
-    "sync"
-    "github.com/go-kratos/aegis/circuitbreaker"
-    "github.com/go-kratos/aegis/circuitbreaker/sre"
+	"time"
+
+	aegiscb "github.com/go-kratos/aegis/circuitbreaker"
+	"github.com/go-kratos/aegis/circuitbreaker/sre"
+	"github.com/go-kratos/kratos/v2/middleware"
+	"github.com/go-kratos/kratos/v2/middleware/circuitbreaker"
 )
 
-var (
-    breakers = make(map[string]circuitbreaker.Breaker)
-    mu       sync.RWMutex
-)
-
-// GetBreaker gets or creates a breaker for service
-func GetBreaker(service string) circuitbreaker.Breaker {
-    mu.RLock()
-    if b, ok := breakers[service]; ok {
-        mu.RUnlock()
-        return b
-    }
-    mu.RUnlock()
-
-    mu.Lock()
-    defer mu.Unlock()
-
-    if b, ok := breakers[service]; ok {
-        return b
-    }
-
-    b := sre.NewBreaker(
-        sre.WithSuccessThreshold(0.5),
-    )
-    breakers[service] = b
-    return b
+func ClientBreaker() middleware.Middleware {
+	return circuitbreaker.Client(
+		circuitbreaker.WithCircuitBreaker(func() aegiscb.CircuitBreaker {
+			return sre.NewBreaker(
+				sre.WithSuccess(0.6),
+				sre.WithRequest(100),
+				sre.WithWindow(3*time.Second),
+				sre.WithBucket(10),
+			)
+		}),
+	)
 }
 ```
 
-Usage:
+The Aegis SRE implementation uses adaptive probabilistic shedding based on recent accepted and total requests. Avoid describing it as a generic three-state breaker unless the selected implementation actually exposes those semantics.
 
-```go
-breaker := breaker.GetBreaker("user-service")
+Tune from measurements:
 
-conn, err := grpc.DialInsecure(
-    context.Background(),
-    grpc.WithEndpoint("discovery:///user-service"),
-    grpc.WithMiddleware(
-        circuitbreaker.Client(
-            circuitbreaker.WithBreaker(breaker),
-        ),
-    ),
-)
-```
+- `WithRequest` controls the minimum volume before shedding;
+- `WithSuccess` controls aggressiveness through the accepted-request ratio;
+- `WithWindow` defines the observation window; and
+- `WithBucket` defines its resolution.
 
-## Custom Circuit Breaker
+## Control failure classification
 
-Implement custom breaker by implementing the `Breaker` interface:
+The compile-tested middleware classifies failures directly rather than exposing `WithFilter`. Normalize dependency failures before they return through the breaker:
 
-```go
-type Breaker interface {
-    Allow() error
-    MarkSuccess()
-    MarkFailed()
-}
-```
+- map transport and backend availability failures to service unavailable or gateway timeout;
+- keep validation, authentication, conflict, and other caller errors as 4xx-class Kratos errors; and
+- preserve causes for logs and traces without exposing internal details publicly.
 
-Example:
+If an application requires a different classification policy, implement a small client middleware around the call or a custom `circuitbreaker.CircuitBreaker` integration and verify middleware order explicitly.
 
-```go
-type customBreaker struct {
-    failures int64
-    total    int64
-    mu       sync.RWMutex
-}
+## Design fallback behavior
 
-func (b *customBreaker) Allow() error {
-    b.mu.RLock()
-    defer b.mu.RUnlock()
+Fallback is a business decision, not a generic middleware default. Use only bounded, semantically valid alternatives such as:
 
-    if b.total == 0 {
-        return nil
-    }
+- a fresh-enough cache entry;
+- a degraded response with an explicit field indicating incompleteness;
+- queued asynchronous work when the contract permits it; or
+- a fast service-unavailable error.
 
-    failureRate := float64(b.failures) / float64(b.total)
-    if failureRate > 0.5 {
-        return errors.New("circuit breaker open")
-    }
-    return nil
-}
+Match rejection with `errors.Is(err, circuitbreaker.ErrNotAllowed)` rather than parsing error strings. Keep fallback latency bounded and observable.
 
-func (b *customBreaker) MarkSuccess() {
-    b.mu.Lock()
-    b.total++
-    b.mu.Unlock()
-}
+## Verification
 
-func (b *customBreaker) MarkFailed() {
-    b.mu.Lock()
-    b.failures++
-    b.total++
-    b.mu.Unlock()
-}
-```
+Complete circuit-breaker work only when:
 
-## Best Practices
+- the middleware is installed on the intended client path;
+- failure classification tests cover 4xx, 5xx, timeout, cancellation, and local rejection;
+- thresholds are tested with sufficient request volume;
+- fallback behavior preserves the API contract;
+- rejected calls emit metrics and traces; and
+- retries cannot amplify non-idempotent work or overload recovery.
 
-### 1. Set Appropriate Thresholds
+## Sources
 
-```go
-// For critical services: lower threshold
-criticalBreaker := sre.NewBreaker(
-    sre.WithSuccessThreshold(0.9),
-    sre.WithRequestVolume(50),
-)
-
-// For non-critical: higher threshold
-tolerantBreaker := sre.NewBreaker(
-    sre.WithSuccessThreshold(0.3),
-    sre.WithRequestVolume(10),
-)
-```
-
-### 2. Error Filtering
-
-```go
-// Only count server errors
-circuitbreaker.Client(
-    circuitbreaker.WithBreaker(breaker),
-    circuitbreaker.WithFilter(func(err error) bool {
-        if err == nil {
-            return false
-        }
-
-        // Don't count client errors (4xx)
-        if e := errors.FromError(err); e != nil {
-            return e.Code >= 500
-        }
-
-        // Count connection errors
-        if errors.Is(err, syscall.ECONNREFUSED) {
-            return true
-        }
-
-        return true
-    }),
-)
-```
-
-### 3. Fallback Strategy
-
-```go
-func callWithFallback(ctx context.Context, client pb.UserClient) (*pb.User, error) {
-    user, err := client.GetUser(ctx, &pb.GetUserRequest{Id: "123"})
-    if err != nil {
-        // Check if it's circuit breaker error
-        if strings.Contains(err.Error(), "circuit breaker") {
-            // Return fallback/cached data
-            return getCachedUser("123"), nil
-        }
-        return nil, err
-    }
-    return user, nil
-}
-```
-
-## ✅ Correct vs ❌ Incorrect Examples
-
-### ✅ Correct: Client-Side Breaker
-
-```go
-// Correct: breaker on client side
-conn, err := grpc.DialInsecure(
-    ctx,
-    grpc.WithEndpoint("discovery:///backend-service"),
-    grpc.WithMiddleware(
-        circuitbreaker.Client(
-            circuitbreaker.WithBreaker(sre.NewBreaker()),
-        ),
-    ),
-)
-```
-
-### ❌ Incorrect: No Error Filtering
-
-```go
-// Wrong: all errors trigger breaker
-conn, err := grpc.DialInsecure(
-    ctx,
-    grpc.WithMiddleware(
-        circuitbreaker.Client(
-            circuitbreaker.WithBreaker(breaker),
-            // Missing: WithFilter to exclude 4xx errors
-        ),
-    ),
-)
-```
-
-### ✅ Correct: Per-Service Breaker
-
-```go
-// Correct: separate breaker per service
-userBreaker := sre.NewBreaker()
-orderBreaker := sre.NewBreaker()
-
-userConn, _ := grpc.DialInsecure(ctx,
-    grpc.WithMiddleware(circuitbreaker.Client(
-        circuitbreaker.WithBreaker(userBreaker),
-    )),
-)
-
-orderConn, _ := grpc.DialInsecure(ctx,
-    grpc.WithMiddleware(circuitbreaker.Client(
-        circuitbreaker.WithBreaker(orderBreaker),
-    )),
-)
-```
-
-## References
-
-- [Kratos Circuit Breaker Middleware](https://go-kratos.dev/docs/component/middleware/circuitbreaker)
-- [Aegis Circuit Breaker](https://github.com/go-kratos/aegis/tree/main/circuitbreaker)
-- [Google SRE Book - Handling Overload](https://sre.google/sre-book/handling-overload/)
+- [Kratos v2.9.2 circuit-breaker middleware](https://github.com/go-kratos/kratos/blob/v2.9.2/middleware/circuitbreaker/circuitbreaker.go)
+- [Aegis v0.2.0 SRE breaker](https://github.com/go-kratos/aegis/blob/v0.2.0/circuitbreaker/sre/sre.go)
